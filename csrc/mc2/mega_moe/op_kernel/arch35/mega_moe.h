@@ -1278,7 +1278,7 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::Process()
     }
     SyncAll<false>();            // aic需要等待flag位reset清理完成
     CrossRankSyncInWorldSize();  // 全卡同步
-
+    
     // 2.本卡专家接收数据dispatch & GroupMatmul1 & SwigluQuant
     DispatchBuffInit();
     GMMAddrInfo dispatchAddrInfo;

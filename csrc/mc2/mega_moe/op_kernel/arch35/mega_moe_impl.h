@@ -693,7 +693,12 @@ __aicore__ inline void AicComputeA8W4(
                     config.blockNum * 2, groupIdx, gmm2CombineSyncCounterPtr);
             }
         }
-        NotifyVectorToCopyIn();
+        constexpr bool hasAiv1GmEpilogue = Policy::IS_GMM1 || CombineQuantMode == COMBINE_NO_QUANT;
+ 	    if constexpr (hasAiv1GmEpilogue) {
+ 	        // Keep at most one AIC-to-AIV1 GM tile notification outstanding.
+ 	        NotifyAiv1GmTileReady();
+                WaitForAiv1GmTileAccepted();
+ 	    }
     }
 }
 
@@ -730,7 +735,9 @@ __aicore__ inline void AivGmm1PostA8W4(SwigluQuantOp& swigluQuantOp, Scheduler& 
         uint32_t mLoc = Get<M_VALUE>(blockCoord);
         uint32_t nLoc = Get<N_VALUE>(blockCoord);
 
-        WaitForCubeFinishCopyout();
+        WaitForAicGmTileReady();
+ 	// Acknowledge before processing so AIC can issue the next tile concurrently.
+ 	NotifyAicGmTileAccepted();
         AscendC::SetFlag<AscendC::HardEvent::S_MTE2>(0);
         AscendC::WaitFlag<AscendC::HardEvent::S_MTE2>(0);
         auto tensorBlockGmFirst = l0cOutGm.Slice(
@@ -775,7 +782,9 @@ __aicore__ inline void AivGmm2PostA8W4(Scheduler& scheduler, TensorC& l0cOutGm, 
         uint32_t mLoc = Get<M_VALUE>(blockCoord);
         uint32_t nLoc = Get<N_VALUE>(blockCoord);
 
-        WaitForCubeFinishCopyout();
+        WaitForAicGmTileReady();
+        // Acknowledge before processing so AIC can issue the next tile concurrently.
+ 	NotifyAicGmTileAccepted();
         auto tensorBlockGm = l0cOutGm.Slice(
             Te::MakeCoord(mLoc, nLoc), Te::MakeShape(Get<M_VALUE>(actualShape), Get<N_VALUE>(actualShape)));
         auto layoutL0cUB = MakeLayoutC{}(L1_TILE_M_256, L1_TILE_N);

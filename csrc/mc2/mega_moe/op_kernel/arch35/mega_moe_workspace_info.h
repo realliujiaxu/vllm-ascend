@@ -49,6 +49,7 @@ constexpr uint8_t SYNC_AIC_AIV_MODE = 4;
 constexpr uint16_t AIC_SYNC_AIV_FLAG = 4;
 constexpr uint16_t AIV_SYNC_AIC_FLAG = 6;
 constexpr uint16_t AIC_SYNC_AIV_EPILOGUE_FLAG = 8;
+constexpr uint16_t AIV1_SYNC_AIC_EPILOGUE_ACK_FLAG = 9;
 constexpr uint16_t FLAG_ID_MAX_PER_V = 16;
 constexpr uint32_t SWIGLU_N_HALF = 2U;
 constexpr int32_t MXFP_DIVISOR_SIZE = 64;

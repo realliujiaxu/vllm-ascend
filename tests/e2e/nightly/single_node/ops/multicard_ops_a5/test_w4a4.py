@@ -22,7 +22,7 @@ except ImportError:
     pass
 
 from vllm_ascend.ops.mega_moe import get_symm_buffer_for_mega_moe, mega_moe
-from vllm_ascend.ops.mega_moe import npu_get_mega_moe_ccl_buffer_size as get_mega_moe_ccl_buffer_size
+from vllm_ascend.ops.mega_moe import get_mega_moe_ccl_buffer_size
 
 E = 4
 BS = 256

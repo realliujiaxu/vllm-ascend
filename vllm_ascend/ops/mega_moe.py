@@ -28,7 +28,7 @@ def _get_hccl_comm_name(group: dist.ProcessGroup, rank_id: int) -> str:
     return group_name
 
 
-def npu_get_mega_moe_ccl_buffer_size(
+def get_mega_moe_ccl_buffer_size(
     ep_world_size: int,
     moe_expert_num: int,
     num_max_tokens_per_rank: int,

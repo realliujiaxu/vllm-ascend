@@ -67,6 +67,7 @@ def unified_fused_experts_eager(hidden_states: torch.Tensor,
                                 shared_gate_up: Optional[Any] = None,
                                 shared_dequant_scale: Optional[Any] = None,
                                 mc2_mask: Optional[torch.Tensor] = None,
+                                pertoken_scale: Optional[torch.Tensor] = None,
                                 apply_router_weight_on_input: bool = False,
                                 with_quant: bool = False,
                                 fusion_mlp: bool = False):
@@ -85,7 +86,8 @@ def unified_fused_experts_eager(hidden_states: torch.Tensor,
         shared_dequant_scale=shared_dequant_scale,
         mc2_mask=mc2_mask,
         apply_router_weight_on_input=apply_router_weight_on_input,
-        with_quant=with_quant)
+        with_quant=with_quant,
+        pertoken_scale=pertoken_scale)
 
     expert_output = unified_apply_mlp(
         hidden_states=results["hidden_states"],
@@ -383,6 +385,51 @@ class AscendFusedMoE(FusedMoE):
             get_dp_group().broadcast(buffer[start:end, :], idx)
         return buffer
 
+    def _allgather_with_unpadding(group, input_: torch.Tensor):
+        input_ = group.all_gather(input_, 0)
+        # unpad
+        num_padding_tokens = get_num_padding_tokens()
+        if get_num_padding_tokens() > 0:
+            input_ = input_[:-num_padding_tokens]
+
+        return input_
+
+    def tp_allgather_with_unpadding(input_: torch.Tensor):
+        return _allgather_with_unpadding(get_tp_group(), input_)
+
+    def _expert_parallel_allgather_with_unpadding(
+            input_: torch.Tensor) -> torch.Tensor:
+        return _allgather_with_unpadding(get_ep_group(), input_)
+
+    def _expert_parallel_allgather_with_dp_unpadding(
+            input_: torch.Tensor) -> torch.Tensor:
+        input_ = get_ep_group().all_gather(input_, 0)
+        padded_length = get_padded_token_count_aligned_to_tp()
+        dp_size = get_dp_group().world_size
+        # unpad
+        # TODO: add comment
+        cu_tokens_across_dp_cpu = get_forward_context(
+        ).dp_metadata.cu_tokens_across_dp_cpu
+        new_shape = (cu_tokens_across_dp_cpu[-1], ) + input_.shape[1:]
+        unpadded_output = torch.empty(new_shape,
+                                      device=input_.device,
+                                      dtype=input_.dtype)
+        input_ = input_.view(dp_size, padded_length, *input_.shape[1:])
+        for idx in range(dp_size):
+            start = 0 if idx == 0 else cu_tokens_across_dp_cpu[idx - 1]
+            end = cu_tokens_across_dp_cpu[idx]
+            num_tokens_dp = end - start
+            unpadded_output[start:end, ...] = input_[idx, :num_tokens_dp, ...]
+
+        return unpadded_output
+
+    def expert_parallel_allgather_with_unpadding(
+            input_: torch.Tensor) -> torch.Tensor:
+        if get_dp_group().world_size > 1:
+            return _expert_parallel_allgather_with_dp_unpadding(input_)
+        else:
+            return _expert_parallel_allgather_with_unpadding(input_)
+
     def forward(self,
                 hidden_states: torch.Tensor,
                 router_logits: torch.Tensor,
@@ -482,6 +529,23 @@ class AscendFusedMoE(FusedMoE):
                     router_logits = self.naive_multicast(
                         router_logits, cu_tokens_across_dp_cpu)
 
+        # 1. w8a8_dynamic量化, 2. allgather dispatcher, 3. enable prefill optimization (enable_shared_expert_dp)
+        if forward_context.quant_allgather_enabled:
+            hidden_states, pertoken_scale = torch_npu.npu_dynamic_quant(
+                hidden_states)
+            router_logits = expert_parallel_allgather_with_unpadding(
+                router_logits)
+            hidden_states = expert_parallel_allgather_with_unpadding(
+                hidden_states)
+            # TODO(realliujiaxu): delete clone() and fix bug in QuantBatchMatmul
+            pertoken_scale = expert_parallel_allgather_with_unpadding(
+                pertoken_scale).clone()
+            if shared_experts:
+                shared_hidden_states = shared_experts(
+                    (hidden_states, pertoken_scale))
+        else:
+            pertoken_scale = None
+
         # Matrix multiply.
         e_hidden_states = self.quant_method.apply(
             layer=self,
@@ -506,7 +570,7 @@ class AscendFusedMoE(FusedMoE):
             token_dispatcher=self.token_dispatcher,
             quantized_x_for_share=quantized_x_for_share,
             dynamic_scale_for_share=dynamic_scale_for_share,
-        )
+            pertoken_scale=pertoken_scale)
 
         if shared_experts:
             if isinstance(e_hidden_states, tuple):

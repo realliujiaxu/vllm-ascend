@@ -990,6 +990,8 @@ class TorchairDeepseekV2ForCausalLM(DeepseekV2ForCausalLM):
 
                 if is_pp_missing_parameter(name, self):
                     continue
+                if name not in params_dict:
+                    continue
 
                 param = params_dict[name]
                 weight_loader = param.weight_loader
@@ -1003,6 +1005,8 @@ class TorchairDeepseekV2ForCausalLM(DeepseekV2ForCausalLM):
                     name = name.replace(weight_name, param_name)
 
                     if is_pp_missing_parameter(name, self):
+                        continue
+                    if name not in params_dict:
                         continue
 
                     param = params_dict[name]
@@ -1025,6 +1029,8 @@ class TorchairDeepseekV2ForCausalLM(DeepseekV2ForCausalLM):
                         continue
 
                     if is_pp_missing_parameter(name, self):
+                        continue
+                    if name not in params_dict:
                         continue
 
                     param = params_dict[name]

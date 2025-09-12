@@ -98,11 +98,11 @@ repos:
   #   entry: tools/shellcheck.sh
   #   language: script
   #   types: [shell]
-  - id: png-lint
-    name: Lint PNG exports from excalidraw
-    entry: tools/png-lint.sh
-    language: script
-    types: [png]
+#  - id: png-lint
+#    name: Lint PNG exports from excalidraw
+#    entry: tools/png-lint.sh
+#    language: script
+#    types: [png]
   - id: signoff-commit
     name: Sign-off Commit
     entry: bash

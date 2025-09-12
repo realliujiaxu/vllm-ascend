@@ -16,12 +16,14 @@
 # This file is a part of the vllm-ascend project.
 # Adapted from https://github.com/vllm-project/vllm/tree/main/tools
 #
+import io
 import os
 import sys
 
 VLLM_ASCEND_SRC = "vllm_ascend"
 # TODO: Re-enable this after upstream fixed
 # VLLM_SRC = "vllm-empty/vllm"
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
 
 def check_init_file_in_package(directory):

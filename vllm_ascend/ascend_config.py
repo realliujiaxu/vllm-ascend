@@ -79,6 +79,13 @@ class AscendConfig:
                 raise AssertionError(
                     "oproj_tensor_parallel_size is only supported in pd scenario and can only be used in D node."
                 )
+        self.gate_dp_enabled = additional_config.get(
+            "gate_dp_enabled", False
+        )
+        self.quant_allgather_enabled = additional_config.get(
+            "quant_allgather_enabled", False
+        )
+
 
 
 class TorchairGraphConfig:

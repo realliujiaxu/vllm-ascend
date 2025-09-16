@@ -48,7 +48,7 @@ from vllm_ascend.ops.sequence_parallel import MetadataForPadding
 from vllm_ascend.utils import (ACL_FORMAT_FRACTAL_NZ, dispose_tensor,
                                get_all_reduce_merge_state,
                                get_rm_router_logits_state, is_310p)
-
+from vllm.logger import logger
 
 def unified_fused_experts_eager(hidden_states: torch.Tensor,
                                 w1: torch.Tensor,
@@ -67,6 +67,7 @@ def unified_fused_experts_eager(hidden_states: torch.Tensor,
                                 shared_gate_up: Optional[Any] = None,
                                 shared_dequant_scale: Optional[Any] = None,
                                 mc2_mask: Optional[torch.Tensor] = None,
+                                pertoken_scale: Optional[torch.Tensor] = None,
                                 apply_router_weight_on_input: bool = False,
                                 with_quant: bool = False,
                                 fusion_mlp: bool = False):
@@ -85,7 +86,8 @@ def unified_fused_experts_eager(hidden_states: torch.Tensor,
         shared_dequant_scale=shared_dequant_scale,
         mc2_mask=mc2_mask,
         apply_router_weight_on_input=apply_router_weight_on_input,
-        with_quant=with_quant)
+        with_quant=with_quant,
+        pertoken_scale=pertoken_scale)
 
     expert_output = unified_apply_mlp(
         hidden_states=results["hidden_states"],
@@ -408,6 +410,7 @@ class AscendFusedMoE(FusedMoE):
         mc2_mask = forward_context.mc2_mask
         # For w8a8 dynamic we can do npu_dynamic_quant and gate in parallel.
         quantized_x_for_share, dynamic_scale_for_share = None, None
+        ascend_config = get_ascend_config()
 
         if shared_experts:
             # When all_reduce_merge is in progress, shared_experts does not do all_reduce in mlp, but waits until shared_experts+router_experts are completed before doing all_reduce
@@ -480,7 +483,23 @@ class AscendFusedMoE(FusedMoE):
                     router_logits = self.naive_multicast(
                         router_logits, cu_tokens_across_dp_cpu)
 
+        pertoken_scale = None
+        # TODO replace gate_dp_enabled with gate_dp_enabled and allgather dispatcher
+        if ascend_config.gate_dp_enabled:
+            if ascend_config.quant_allgather_enabled:
+                hidden_states, pertoken_scale = torch_npu.npu_dynamic_quant(
+                    hidden_states)
+                # TODO(realliujiaxu): delete clone() and fix bug in QuantBatchMatmul
+                pertoken_scale = self.expert_parallel_allgather_with_unpadding(
+                    pertoken_scale).clone()
+
+            hidden_states = self.expert_parallel_allgather_with_unpadding(
+                hidden_states)
+            router_logits = self.expert_parallel_allgather_with_unpadding(
+                router_logits)
+
         # Matrix multiply.
+        logger.info(f"before quant_method {hidden_states.shape}")
         e_hidden_states = self.quant_method.apply(
             layer=self,
             x=hidden_states,
@@ -504,7 +523,23 @@ class AscendFusedMoE(FusedMoE):
             token_dispatcher=self.token_dispatcher,
             quantized_x_for_share=quantized_x_for_share,
             dynamic_scale_for_share=dynamic_scale_for_share,
-        )
+            pertoken_scale=pertoken_scale)
+        logger.info(f"e_hidden_states {e_hidden_states.shape}")
+
+        # TODO EP reducescatter and overlap with shared_experts
+        if ascend_config.overlap_shared_experts:
+            e_hidden_states, handle = self.expert_parallel_reducescatter_async(e_hidden_states)
+            shared_hidden_states = shared_experts(hidden_states)
+            handle.wait()
+        else:
+            num_pad_tokens = get_forward_context().num_pad_tokens \
+                if hasattr(get_forward_context(), "num_pad_tokens") else 0
+            if num_pad_tokens > 0:
+                e_hidden_states = nn.functional.pad(
+                    e_hidden_states, (0, 0, 0, num_pad_tokens))
+            e_hidden_states = get_ep_group().reduce_scatter(e_hidden_states, 0)
+
+        logger.info(f"e_hidden_states after reduce scatter {e_hidden_states.shape}")
 
         if shared_experts:
             if isinstance(e_hidden_states, tuple):

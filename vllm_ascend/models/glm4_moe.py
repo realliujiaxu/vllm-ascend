@@ -40,6 +40,8 @@ from vllm.model_executor.models.interfaces import SupportsLoRA, SupportsPP
 from vllm.model_executor.models.utils import (PPMissingLayer, make_empty_intermediate_tensors_factory,
                     make_layers, maybe_prefix)
 
+from vllm_ascend.ascend_config import get_ascend_config
+
 logger = init_logger(__name__)
 
 
@@ -68,14 +70,15 @@ class CustomGlm4MoE(Glm4MoE):
         final_hidden_states = self.experts(
             hidden_states=hidden_states,
             router_logits=router_logits) * self.routed_scaling_factor
-        if shared_output is not None:
-            if moe_comm_method_name in {"alltoallcommimpl", "mc2commimpl"}:
-                shared_output = tensor_model_parallel_all_reduce(shared_output)
-            final_hidden_states = final_hidden_states + shared_output
+        # if shared_output is not None:
+        #     if moe_comm_method_name in {"alltoallcommimpl", "mc2commimpl"}:
+        #         shared_output = tensor_model_parallel_all_reduce(shared_output)
+        #     final_hidden_states = final_hidden_states + shared_output
         if self.tp_size > 1:
             final_hidden_states = (
                 self.experts.maybe_all_reduce_tensor_model_parallel(
                     final_hidden_states))
+        final_hidden_states = final_hidden_states + shared_output
         return final_hidden_states.view(-1, hidden_dim)
 
 

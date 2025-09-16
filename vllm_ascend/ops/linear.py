@@ -33,6 +33,7 @@ from vllm.model_executor.layers.quantization.base_config import \
     QuantizationConfig
 from vllm.model_executor.utils import set_weight_attrs
 
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.distributed.parallel_state import (get_mlp_tp_group,
                                                     get_otp_group)
 from vllm_ascend.utils import (dense_optim_enable, matmul_allreduce_enable,
@@ -198,7 +199,7 @@ def get_column_parallel_op(
 ) -> Tuple[
         Optional[Union[MLPColumnParallelOp, DenseOptimMergedColumnParallelOp,
                        DenseOptimQKVParallelOp]], int, int]:
-    if disable_tp:
+    if disable_tp or ("shared_experts" in prefix and get_ascend_config().enable_shared_expert_dp):
         return None, 0, 1
 
     custom_op: Optional[Union[
@@ -425,7 +426,7 @@ def get_row_parallel_op(
 ) -> Tuple[Optional[Union[MLPRowParallelOp, OProjRowParallelOp,
                           MatmulAllreduceRowParallelOp,
                           DenseOptimRowParallelOp]], int, int]:
-    if disable_tp:
+    if disable_tp or ("shared_experts" in prefix and get_ascend_config().enable_shared_expert_dp):
         return None, 0, 1
 
     custom_op: Optional[Union[MLPRowParallelOp, OProjRowParallelOp,

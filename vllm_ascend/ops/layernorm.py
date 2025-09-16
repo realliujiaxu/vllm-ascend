@@ -55,8 +55,8 @@ class AddRMSNormW8A8Quant(RMSNorm):
                 self.layer.aclnn_input_offset,
                 epsilon=self.variance_epsilon)
             torch.ops.vllm.maybe_wait_prefetch_done(x)
-            is_glm4_moe = get_forward_context().is_glm4_moe
-            x = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(x, is_glm4_moe)
+            # is_glm4_moe = get_forward_context().is_glm4_moe
+            # x = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(x, is_glm4_moe)
             return x, residual
 
         x, residual = torch_npu.npu_rms_norm(x, self.weight,
@@ -96,8 +96,8 @@ class AscendRMSNorm(RMSNorm):
                 x, _, residual = torch_npu.npu_add_rms_norm(
                     x, residual, self.weight, self.variance_epsilon)
             torch.ops.vllm.maybe_wait_prefetch_done(x)
-            is_glm4_moe = get_forward_context().is_glm4_moe
-            x = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(x, is_glm4_moe and "post_attention_layernorm" in self.prefix)
+            # is_glm4_moe = get_forward_context().is_glm4_moe
+            # x = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(x, is_glm4_moe and "post_attention_layernorm" in self.prefix)
             return x, residual
 
         x, residual = torch_npu.npu_rms_norm(x, self.weight,

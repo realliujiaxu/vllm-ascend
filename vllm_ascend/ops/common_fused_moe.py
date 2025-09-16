@@ -330,6 +330,12 @@ class AscendFusedMoE(FusedMoE):
 
         forward_context.moe_comm_method = getattr(self, moe_comm_method_name)
 
+        # TODO(realliujiaxu) move allgather to moe_comm_method.prepare
+        hidden_states = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
+            hidden_states, get_forward_context().is_glm4_moe)
+        router_logits = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
+            router_logits, get_forward_context().is_glm4_moe)
+
         hidden_states, router_logits = forward_context.moe_comm_method.prepare(
             hidden_states=hidden_states, router_logits=router_logits)
 

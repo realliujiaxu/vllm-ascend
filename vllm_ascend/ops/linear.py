@@ -139,7 +139,9 @@ class DenseOptimMergedColumnParallelOp(CustomColumnParallelOp):
 
         # Matrix multiply.
         assert self.quant_method is not None
-
+        from vllm.forward_context import get_forward_context
+        if not get_forward_context().is_glm4_moe:
+            input_ = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(input_, True)
         input_ = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(input_, True)
         output_parallel = self.quant_method.apply(self.layer, input_, bias)
 
@@ -206,7 +208,7 @@ def get_column_parallel_op(
     ]] = None
     if "gate_up_proj" in prefix and mlp_tp_enable():
         custom_op = MLPColumnParallelOp(layer)
-    elif "gate_up_proj" in prefix and dense_optim_enable():
+    elif "shared_experts" not in prefix and "gate_up_proj" in prefix and dense_optim_enable():
         custom_op = DenseOptimMergedColumnParallelOp(layer)
     elif dense_optim_enable():
         custom_op = DenseOptimQKVParallelOp(layer, prefix)

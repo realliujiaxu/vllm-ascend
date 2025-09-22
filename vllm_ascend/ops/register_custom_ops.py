@@ -11,6 +11,7 @@ from vllm.logger import logger
 from vllm.utils import direct_register_custom_op
 
 import vllm_ascend.envs as envs_ascend
+from vllm_ascend.ascend_config import get_ascend_config
 
 
 def _maybe_chunk_residual_impl(x: torch.Tensor,
@@ -22,16 +23,18 @@ def _maybe_chunk_residual_impl(x: torch.Tensor,
         return residual
 
     if x.size(0) != residual.size(0):
-        flashcomm_v1_enabled = forward_context.flashcomm_v1_enabled
-        assert flashcomm_v1_enabled is True, (
-            "Currently, this situation only occurs "
-            "when flashcomm_v1 is enabled")
-        pad_size = forward_context.pad_size
-        if pad_size > 0:
-            residual = F.pad(residual, (0, 0, 0, pad_size))
-        tp_size = get_tensor_model_parallel_world_size()
-        tp_rank = get_tensor_model_parallel_rank()
-        residual = torch.chunk(residual, tp_size, dim=0)[tp_rank]
+        from vllm.logger import logger
+        logger.info(f"{x.size()} {residual.size()}")
+        if forward_context.flashcomm_v1_enabled or get_ascend_config().enable_shared_expert_dp:
+            pad_size = forward_context.pad_size
+            if pad_size > 0:
+                residual = F.pad(residual, (0, 0, 0, pad_size))
+            tp_size = get_tensor_model_parallel_world_size()
+            tp_rank = get_tensor_model_parallel_rank()
+            residual = torch.chunk(residual, tp_size, dim=0)[tp_rank]
+        else:
+            raise RuntimeError("x.size(0) != residual.size(0) only occurs "
+                               "when flashcomm_v1 or enable_shared_expert_dp is enabled")
 
     return residual
 
@@ -59,9 +62,9 @@ def _maybe_pad_and_reduce_impl(x: torch.Tensor) -> torch.Tensor:
     except AssertionError:
         logger.info("Forward context is None, skipping the operation.")
         return tensor_model_parallel_all_reduce(x)
-
-    flashcomm_v1_enabled = forward_context.flashcomm_v1_enabled
-    if flashcomm_v1_enabled:
+    logger.info(f"_maybe_pad_and_reduce_impl enable_shared_expert_dp {get_ascend_config().enable_shared_expert_dp}")
+    if forward_context.flashcomm_v1_enabled or get_ascend_config().enable_shared_expert_dp:
+        logger.info(f"pad_size {forward_context.pad_size}")
         pad_size = forward_context.pad_size
         if pad_size > 0:
             x = F.pad(x, (0, 0, 0, pad_size))

@@ -939,20 +939,24 @@ class AscendMLAImpl(MLAAttentionImpl):
         need_gather_q_kv: bool = False,
         output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        from vllm.logger import logger
         assert output is not None, "Output tensor must be provided."
         if attn_metadata is None:
             # Profiling run.
             return output
         num_actual_tokens = attn_metadata.num_actual_tokens
+        logger.info(f"num_actual_tokens {num_actual_tokens}")
         assert attn_metadata.num_decodes is not None and \
         attn_metadata.num_prefills is not None and \
         attn_metadata.num_decode_tokens is not None
         num_decode_tokens = attn_metadata.num_decode_tokens
+        logger.info(f"num_decode_tokens {num_decode_tokens}")
         # Inputs and outputs may be padded for CUDA graphs
         output_padded = output
         output = output[:num_actual_tokens, ...]
         o_proj_input_shape = (num_actual_tokens,
                               self.num_heads * self.v_head_dim)
+        logger.info(f"o_proj_input_shape {o_proj_input_shape}")
         o_proj_input = torch.empty(o_proj_input_shape,
                                    dtype=hidden_states.dtype,
                                    device=hidden_states.device)
@@ -1000,11 +1004,13 @@ class AscendMLAImpl(MLAAttentionImpl):
                          o_proj_input,
                          max_size=MAX_O_PROJ_PREFETCH_SIZE,
                          enabled=self.enable_prefetch)
-
-            output[...] = self.o_proj(
+            logger.info(f"o_proj_input {o_proj_input.shape}")
+            o_proj_output = self.o_proj(
                 o_proj_input,
-                is_prefill=prefill_preprocess_res is not None,
-                is_force_scatter=self.enable_shared_expert_dp)[0]
+                is_prefill=prefill_preprocess_res is not None)[0]
+            logger.info(f"o_proj_output {o_proj_output.shape}")
+            logger.info(f"output {output.shape}")
+            output[...] = o_proj_output
         else:
             with torch.npu.stream(current_ms_metadata.comm_stream):
                 npu_prefetch(self.o_proj.weight,
@@ -1013,8 +1019,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                              enabled=self.enable_prefetch)
                 output[...] = self.o_proj(
                     o_proj_input,
-                    is_prefill=prefill_preprocess_res is not None,
-                    is_force_scatter=self.enable_shared_expert_dp)[0]
+                    is_prefill=prefill_preprocess_res is not None)[0]
                 current_ms_metadata.after_comm_event.record()
         del o_proj_input
         return output_padded

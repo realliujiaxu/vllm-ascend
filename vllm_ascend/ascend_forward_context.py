@@ -11,6 +11,7 @@ from vllm.forward_context import (BatchDescriptor, get_forward_context,
                                   set_forward_context)
 
 import vllm_ascend.envs as envs_ascend
+from vllm_ascend.ascend_config import get_ascend_config
 
 
 class FusedMoEState(Enum):
@@ -99,7 +100,7 @@ def set_ascend_forward_context(
             tp_world_size > 1 and \
             num_tokens is not None and num_tokens > 1000
 
-        if flashcomm_v1_enabled:
+        if flashcomm_v1_enabled or get_ascend_config().enable_shared_expert_dp:
             pad_size = (tp_world_size -
                         (num_tokens % tp_world_size)) % tp_world_size
             forward_context.pad_size = pad_size

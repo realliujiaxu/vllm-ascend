@@ -15,10 +15,13 @@
 # This file is a part of the vllm-ascend project.
 
 from abc import ABC, abstractmethod
+from enum import Enum
+from typing import Optional
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+import torch_npu
 from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.distributed.parallel_state import (
     get_dp_group, get_tensor_model_parallel_rank,
@@ -29,7 +32,14 @@ from vllm.model_executor.layers.fused_moe import FusedMoEConfig
 from vllm_ascend.utils import enable_sp
 
 
-class FusedMoEPrepareAndFinalize(ABC):
+
+class QuantType(Enum):
+    NONE = 0
+    W8A8 = 1
+    W4A8 = 2
+
+
+class PrepareAndFinalize(ABC):
     """
     Abstract base class for MoE (Mixture-of-Experts) tensor preparation and finalization
     in distributed environments. Subclasses implement specific communication strategies
@@ -50,8 +60,10 @@ class FusedMoEPrepareAndFinalize(ABC):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
         enable_shared_expert_dp: bool = False,
-        replace_allreduce: bool = False
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        replace_allreduce: bool = False,
+        quant_type: QuantType = QuantType.NONE
+    ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor],
+               Optional[torch.Tensor]]:
         """
         Prepare tensors before MoE computation. May involve:
           - Padding to align communication boundaries
@@ -63,6 +75,7 @@ class FusedMoEPrepareAndFinalize(ABC):
             router_logits (torch.Tensor): Router outputs, shape [num_tokens, num_experts]
             enable_shared_expert_dp (bool): Skip DP communication for shared experts
             replace_allreduce (bool): Bypass default all-reduce behavior
+            quant_type: none, w8a8 or w4a8
 
         Returns:
             Tuple of:
@@ -116,8 +129,10 @@ class FusedMoEPrepareAndFinalizeWithMC2(FusedMoEPrepareAndFinalize):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
         enable_shared_expert_dp: bool = False,
-        replace_allreduce: bool = False
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        replace_allreduce: bool = False,
+        quant_type=QuantType.NONE
+    ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor],
+               Optional[torch.Tensor]]:
         """
         Preparation steps:
           1. Fetch `mc2_mask` and target padding length from forward context.
@@ -215,8 +230,10 @@ class FusedMoEPrepareAndFinalizeWithAll2All(FusedMoEPrepareAndFinalize):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
         enable_shared_expert_dp: bool = False,
-        replace_allreduce: bool = False
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        replace_allreduce: bool = False,
+        quant_type=QuantType.NONE
+    ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor],
+               Optional[torch.Tensor]]:
         """
         Preparation steps:
           1. Pad hidden_states and router_logits to next multiple of TP size.
@@ -309,8 +326,10 @@ class FusedMoEPrepareAndFinalizeWithAllGather(FusedMoEPrepareAndFinalize):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
         enable_shared_expert_dp: bool = False,
-        replace_allreduce: bool = False
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        replace_allreduce: bool = False,
+        quant_type=QuantType.NONE
+    ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor],
+               Optional[torch.Tensor]]:
         """
         Preparation steps:
           AllGather hidden_states and router_logits to form global tensors.
@@ -319,7 +338,8 @@ class FusedMoEPrepareAndFinalizeWithAllGather(FusedMoEPrepareAndFinalize):
             Tuple of (global_hidden_states, global_router_logits, None)
         """
         if enable_sp():
-            return self._prepare_with_ep_group(hidden_states, router_logits)
+            return self._prepare_with_ep_group(hidden_states, router_logits,
+                                               quant_type)
 
         return self._prepare_with_dp_group(hidden_states, router_logits,
                                            enable_shared_expert_dp,
@@ -329,21 +349,34 @@ class FusedMoEPrepareAndFinalizeWithAllGather(FusedMoEPrepareAndFinalize):
         self,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        quant_type=QuantType.NONE
+    ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor],
+               Optional[torch.Tensor]]:
+        pertoken_scale = None
+        if quant_type == QuantType.W8A8:
+            hidden_states, pertoken_scale = torch_npu.npu_dynamic_quant(
+                hidden_states)
+            pertoken_scale = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
+                pertoken_scale, True, True)
         hidden_states = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
             hidden_states, True, True)
         router_logits = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
             router_logits, True, True)
 
-        return hidden_states, router_logits, None
+        if pertoken_scale is not None:
+            return (hidden_states, pertoken_scale), router_logits, None, None
+
+        return hidden_states, router_logits, None, None
 
     def _prepare_with_dp_group(
         self,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
         enable_shared_expert_dp: bool = False,
-        replace_allreduce: bool = False
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        replace_allreduce: bool = False,
+        quant_type=QuantType.NONE
+    ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor],
+               Optional[torch.Tensor]]:
         """
         Preparation steps:
           1. Fetch max token count across DP group from forward context.
@@ -471,8 +504,10 @@ class FusedMoEPrepareAndFinalizeWithNaiveMulticast(FusedMoEPrepareAndFinalize):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
         enable_shared_expert_dp: bool = False,
-        replace_allreduce: bool = False
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        replace_allreduce: bool = False,
+        quant_type=QuantType.NONE
+    ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor],
+               Optional[torch.Tensor]]:
         """
         Preparation steps:
           1. Fetch cumulative token boundaries from forward context.

@@ -121,6 +121,9 @@ class AscendConfig:
         self.enable_async_exponential = bool(
             additional_config.get("enable_async_exponential", False))
 
+        self.enable_async_update_attn_params = bool(
+            additional_config.get("enable_async_update_attn_params", True))
+
 
 class FinegrainedTPConfig:
     """

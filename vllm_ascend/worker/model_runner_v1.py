@@ -18,6 +18,8 @@
 #
 
 import math
+import queue
+import threading
 import time
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
@@ -94,7 +96,8 @@ from vllm_ascend.compilation.acl_graph import (ACLGraphWrapper,
                                                update_attn_dcp_pcp_params,
                                                update_attn_params,
                                                update_mla_attn_dcp_pcp_params,
-                                               update_mla_attn_params)
+                                               update_mla_attn_params,
+                                               update_attn_params_async)
 # yapf: enable
 from vllm_ascend.eplb.adaptor.vllm_adaptor import VllmEplbAdaptor
 from vllm_ascend.eplb.core.eplb_device_transfer_loader import \
@@ -356,6 +359,32 @@ class NPUModelRunner(GPUModelRunner):
         # None in the first PP rank. The rest are set after load_model.
         self.intermediate_tensors: IntermediateTensors | None = None
         self.reorder_batch_threshold: int | None = None
+
+        self.enable_async_update_attn_params = (
+            self.ascend_config.enable_async_update_attn_params)
+        self.attn_params_queue: Optional[queue.Queue] = None
+        self._attn_params_thread: Optional[threading.Thread] = None
+        if self.enable_async_update_attn_params:
+            self.attn_params_queue = queue.Queue()
+            self._attn_params_thread = threading.Thread(
+                target=self._attn_params_worker,
+                name="attn_params_async",
+                daemon=True,
+            )
+            self._attn_params_thread.start()
+
+    def _attn_params_worker(self) -> None:
+        """Worker thread: block on attn_params_queue for (seq_lens, actual_seq_lengths_q)
+        and (forward_context, runtime_shape), then call update_attn_params_async.
+        """
+        update_stream = torch.npu.Stream(device=self.device)
+        while True:
+            try:
+                seq_lens, actual_seq_lengths_q, maybe_padded_num_tokens = self.attn_params_queue.get()
+                update_attn_params_async(update_stream, maybe_padded_num_tokens, actual_seq_lengths_q, seq_lens)
+            except Exception:
+                logger.exception("attn_params_worker failed")
+                raise
 
     def _init_device_properties(self) -> None:
         self.num_sms = None
@@ -759,6 +788,46 @@ class NPUModelRunner(GPUModelRunner):
         self.seq_lens.np[:num_reqs] = (
             self.input_batch.num_computed_tokens_cpu[:num_reqs] +
             num_scheduled_tokens)
+
+        # NOTE: This is a temporary hack, now in GPUModelRunner, this prepare_inputs
+        # has been split to multiple parts, and there are 3 parts that is related to this
+        # `num_reqs`, we'll take `query_start_loc` as an example:
+        # 1. self.query_start_loc.np[1 : num_reqs + 1] = cu_num_tokens
+        # 2. get `num_reqs_padded`, this depends on dispatcher and which is why we have the
+        #    following simplified `dispatch` logic here, we try to minimize the impact
+        # 3. query_start_loc = self.query_start_loc.gpu[: num_reqs_padded + 1]
+        uniform_decode = (max_num_scheduled_tokens == self.uniform_decode_query_len) \
+                         and (total_num_scheduled_tokens == max_num_scheduled_tokens * num_reqs)
+
+        # TODO: We should make this official ASAP. Also note that if we pad here,
+        # the builders won’t need to add any extra padding.
+        max_decode_tokens = self.scheduler_config.max_num_seqs * self.uniform_decode_query_len
+        if self.compilation_config.cudagraph_mode.decode_mode() == CUDAGraphMode.FULL and \
+                uniform_decode and self.uniform_decode_query_len <= num_input_tokens <= max_decode_tokens:
+            num_reqs_padded = num_input_tokens // self.uniform_decode_query_len
+            pad_size = num_reqs_padded - num_reqs
+            if pad_size > 0:
+                last_query_loc = self.query_start_loc.np[num_reqs]
+
+                self.query_start_loc.np[
+                    num_reqs + 1:num_reqs_padded + 1] = self.arange_np[
+                                                            1:pad_size +
+                                                              1] * self.uniform_decode_query_len + last_query_loc
+                self.query_start_loc.copy_to_gpu(num_reqs_padded + 1)
+        else:
+            num_reqs_padded = num_reqs
+
+        if self.enable_async_update_attn_params:
+            graph_runtime_mode, _ = \
+                self.cudagraph_dispatcher.dispatch(num_tokens=maybe_padded_num_tokens, uniform_decode=uniform_decode,
+                                                   has_lora=False)
+            if graph_runtime_mode == CUDAGraphMode.FULL:
+                self.attn_params_queue.put((
+                    self.seq_lens.cpu[:num_reqs_padded].tolist(),
+                    self.query_start_loc.cpu[1:num_reqs_padded + 1].tolist(),
+                    maybe_padded_num_tokens
+                ))
+
         self.seq_lens.copy_to_gpu()
 
         self.seq_lens.gpu[num_reqs:].fill_(0)
@@ -1015,35 +1084,7 @@ class NPUModelRunner(GPUModelRunner):
                         slot_mapping_for_pcp
                 slot_mapping = blk_table.slot_mapping.gpu
 
-            # NOTE: This is a temporary hack, now in GPUModelRunner, this prepare_inputs
-            # has been split to multiple parts, and there are 3 parts that is related to this
-            # `num_reqs`, we'll take `query_start_loc` as an example:
-            # 1. self.query_start_loc.np[1 : num_reqs + 1] = cu_num_tokens
-            # 2. get `num_reqs_padded`, this depends on dispatcher and which is why we have the
-            #    following simplified `dispatch` logic here, we try to minimize the impact
-            # 3. query_start_loc = self.query_start_loc.gpu[: num_reqs_padded + 1]
-            uniform_decode = (max_num_scheduled_tokens == self.uniform_decode_query_len) \
-                and (total_num_scheduled_tokens == max_num_scheduled_tokens * num_reqs)
-
-            # TODO: We should make this official ASAP. Also note that if we pad here,
-            # the builders won’t need to add any extra padding.
-            max_decode_tokens = self.scheduler_config.max_num_seqs * self.uniform_decode_query_len
-            if self.compilation_config.cudagraph_mode.decode_mode() == CUDAGraphMode.FULL and \
-                uniform_decode and self.uniform_decode_query_len <= num_input_tokens <= max_decode_tokens:
-                num_reqs_padded = num_input_tokens // self.uniform_decode_query_len
-                pad_size = num_reqs_padded - num_reqs
-                if pad_size > 0:
-                    last_query_loc = self.query_start_loc.np[num_reqs]
-
-                    self.query_start_loc.np[
-                        num_reqs + 1:num_reqs_padded + 1] = self.arange_np[
-                            1:pad_size +
-                            1] * self.uniform_decode_query_len + last_query_loc
-                    self.query_start_loc.copy_to_gpu(num_reqs_padded + 1)
-
-                # So we are trying to simulate the behavior of GPUModelRunner's
-                # prepare_inputs for uniform decode mode by padding query_start_loc
-                num_reqs = num_reqs_padded
+            num_reqs = num_reqs_padded
 
             # Make AscendCommonAttentionMetadata
             common_attn_metadata = AscendCommonAttentionMetadata(
@@ -1188,6 +1229,8 @@ class NPUModelRunner(GPUModelRunner):
                     update_attn_dcp_pcp_params(self.update_stream,
                                                forward_context,
                                                maybe_padded_num_tokens)
+                elif self.enable_async_update_attn_params:
+                    pass
                 else:
                     update_attn_params(self.update_stream, forward_context,
                                        maybe_padded_num_tokens,

@@ -195,6 +195,64 @@ class ACLGraphWrapper:
         return entry.output
 
 
+def update_attn_params_async(update_stream, runtime_shape,
+                       actual_seq_lengths_q, seq_lens):
+    # assert not using_paged_attention(runtime_shape, vllm_config), "update_attn_params_async only supports FIA."
+    graph_params = get_graph_params()
+
+    with torch.npu.stream(update_stream):
+        for param, handle, event in zip(
+                graph_params.attn_params[runtime_shape],
+                graph_params.handles[runtime_shape],
+                graph_params.events[runtime_shape],
+        ):
+            (query, key_cache, value, block_tables, attn_mask, block_size,
+             _, _, num_kv_heads, num_heads, scale,
+             attn_output, softmax_lse) = param
+
+            if hasattr(torch_npu._C, "_npu_fused_infer_attention_score_out_graph"):
+                logger.info_once("update attn params using _npu_fused_infer_attention_score_out_graph")
+                output1, softmax_lse1 = torch_npu._C._npu_fused_infer_attention_score_out_graph(
+                    update_stream, handle, event,
+                    query, key_cache, value,
+                    block_table=block_tables,
+                    atten_mask=attn_mask,
+                    input_layout="TND",
+                    block_size=block_size,
+                    actual_seq_lengths=actual_seq_lengths_q,
+                    actual_seq_lengths_kv=seq_lens,
+                    num_key_value_heads=num_kv_heads,
+                    num_heads=num_heads,
+                    scale=scale,
+                    sparse_mode=3,
+                    # workspace=graph_params.workspaces.get(runtime_shape),
+                    out=[attn_output, softmax_lse],
+                )
+
+            else:
+                torch.npu.graph_task_update_begin(update_stream, handle)
+                torch_npu.npu_fused_infer_attention_score.out(
+                    query=query,
+                    key=key_cache,
+                    value=value,
+                    block_table=block_tables,
+                    atten_mask=attn_mask,
+                    input_layout="TND",
+                    block_size=block_size,
+                    actual_seq_lengths=actual_seq_lengths_q,
+                    actual_seq_lengths_kv=seq_lens,
+                    num_key_value_heads=num_kv_heads,
+                    num_heads=num_heads,
+                    scale=scale,
+                    sparse_mode=3,
+                    workspace=graph_params.workspaces.get(runtime_shape),
+                    out=[attn_output, softmax_lse],
+                )
+                torch.npu.graph_task_update_end(update_stream)
+
+                event.record(update_stream)
+
+
 def _update_attn_pa_params(update_stream, forward_context, runtime_shape):
     graph_params = get_graph_params()
     # FIXME: Behold! We are using a temporary hack here to update the args
@@ -273,27 +331,47 @@ def _update_attn_fia_params(update_stream, forward_context, runtime_shape):
             seq_lens = forward_context.attn_metadata[key].seq_lens_list
             actual_seq_lengths_q = forward_context.attn_metadata[
                 key].actual_seq_lengths_q
-            torch.npu.graph_task_update_begin(update_stream, handle)
-            torch_npu.npu_fused_infer_attention_score.out(
-                query=query,
-                key=key_cache,
-                value=value,
-                block_table=block_tables,
-                atten_mask=attn_mask,
-                input_layout="TND",
-                block_size=block_size,
-                actual_seq_lengths=actual_seq_lengths_q,
-                actual_seq_lengths_kv=seq_lens,
-                num_key_value_heads=num_kv_heads,
-                num_heads=num_heads,
-                scale=scale,
-                sparse_mode=3,
-                workspace=graph_params.workspaces.get(runtime_shape),
-                out=[attn_output, softmax_lse],
-            )
-            torch.npu.graph_task_update_end(update_stream)
 
-            event.record(update_stream)
+            if hasattr(torch_npu._C, "_npu_fused_infer_attention_score_out_graph"):
+                logger.info_once("update attn params using _npu_fused_infer_attention_score_out_graph")
+                output1, softmax_lse1 = torch_npu._C._npu_fused_infer_attention_score_out_graph(
+                    update_stream, handle, event,
+                    query, key_cache, value,
+                    block_table=block_tables,
+                    atten_mask=attn_mask,
+                    input_layout="TND",
+                    block_size=block_size,
+                    actual_seq_lengths=actual_seq_lengths_q,
+                    actual_seq_lengths_kv=seq_lens,
+                    num_key_value_heads=num_kv_heads,
+                    num_heads=num_heads,
+                    scale=scale,
+                    sparse_mode=3,
+                    # workspace=graph_params.workspaces.get(runtime_shape),
+                    out=[attn_output, softmax_lse],
+                )
+            else:
+                torch.npu.graph_task_update_begin(update_stream, handle)
+                torch_npu.npu_fused_infer_attention_score.out(
+                    query=query,
+                    key=key_cache,
+                    value=value,
+                    block_table=block_tables,
+                    atten_mask=attn_mask,
+                    input_layout="TND",
+                    block_size=block_size,
+                    actual_seq_lengths=actual_seq_lengths_q,
+                    actual_seq_lengths_kv=seq_lens,
+                    num_key_value_heads=num_kv_heads,
+                    num_heads=num_heads,
+                    scale=scale,
+                    sparse_mode=3,
+                    workspace=graph_params.workspaces.get(runtime_shape),
+                    out=[attn_output, softmax_lse],
+                )
+                torch.npu.graph_task_update_end(update_stream)
+
+                event.record(update_stream)
 
 
 def update_attn_params(update_stream, forward_context, runtime_shape,

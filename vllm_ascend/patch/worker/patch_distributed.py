@@ -111,5 +111,10 @@ class GroupCoordinatorPatch(GroupCoordinator):
             return input_
         return torch.ops.vllm.all_reduce(input_, group_name=self.unique_name)
 
+    def all_gather(self, input_, dim: int = -1) -> torch.Tensor:
+        if self.world_size == 1:
+            return input_
+        return torch.ops.vllm.all_gather(input_, dim=dim, world_size=self.world_size, group_name=self.unique_name)
+
 
 vllm.distributed.parallel_state.GroupCoordinator = GroupCoordinatorPatch

@@ -120,6 +120,7 @@ from vllm_ascend.utils import (
     is_moe_model,
     lmhead_tp_enable,
     set_weight_prefetch_method,
+    vllm_version_is,
 )
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 from vllm_ascend.worker.pcp_utils import PCPManager
@@ -1144,9 +1145,6 @@ class NPUModelRunner(GPUModelRunner):
                         "it when the requests need prompt logprobs"
                     )
 
-                if self.dynamic_eplb:
-                    self.eplb_updator.forward_before()
-
                 num_reqs = self.input_batch.num_reqs
                 req_ids = self.input_batch.req_ids
                 tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
@@ -1255,11 +1253,12 @@ class NPUModelRunner(GPUModelRunner):
                 intermediate_tensors,
             )
 
-            if self.dynamic_eplb:
-                self.eplb_updator.take_update_info_from_eplb_process()
-
             # update global cos, sin
             update_cos_sin(positions)
+
+        if self.dynamic_eplb:
+            with record_function_or_nullcontext("EPLB weight D2D"):
+                self.eplb_updator.forward_before()
 
         # Set cudagraph mode to none if calc_kv_scales is true.
         # KV scales calculation involves dynamic operations that are incompatible
@@ -1507,7 +1506,8 @@ class NPUModelRunner(GPUModelRunner):
         )
 
         if self.dynamic_eplb:
-            self.eplb_updator.forward_end()
+            with record_function_or_nullcontext("EPLB update"):
+                self.eplb_updator.forward_end()
 
         if self.debugger is not None:
             self.debugger.stop()
@@ -1811,9 +1811,11 @@ class NPUModelRunner(GPUModelRunner):
         num_encoder_reqs: int = 0,
     ) -> tuple[CUDAGraphMode, BatchDescriptor, bool, torch.Tensor | None, CUDAGraphStat | None]:
         num_tokens_padded = self._pad_for_sequence_parallelism(num_tokens)
+        is_all_decode = np.all(self.input_batch.num_computed_tokens_cpu[:num_reqs] > 0)
         uniform_decode = (
             (
-                (max_num_scheduled_tokens == self.uniform_decode_query_len)
+                (is_all_decode if self.speculative_config else True)
+                and (max_num_scheduled_tokens == self.uniform_decode_query_len)
                 and (num_tokens == max_num_scheduled_tokens * num_reqs)
             )
             if force_uniform_decode is None
@@ -1825,16 +1827,26 @@ class NPUModelRunner(GPUModelRunner):
         has_lora = len(self.input_batch.lora_id_to_lora_request) > 0 if force_has_lora is None else force_has_lora
 
         # ruff: noqa: E731
-        dispatch_cudagraph = (
-            lambda num_tokens, disable_full: self.cudagraph_dispatcher.dispatch(
-                num_tokens=num_tokens,
-                has_lora=has_lora,
-                uniform_decode=uniform_decode,
-                disable_full=disable_full,
-            )
-            if not force_eager
-            else (CUDAGraphMode.NONE, BatchDescriptor(num_tokens_padded))
-        )
+        def dispatch_cudagraph(num_tokens, disable_full=False, valid_modes=None):
+            if force_eager:
+                return (CUDAGraphMode.NONE, BatchDescriptor(num_tokens_padded))
+
+            if vllm_version_is("0.16.0"):
+                return self.cudagraph_dispatcher.dispatch(
+                    num_tokens=num_tokens,
+                    has_lora=has_lora,
+                    uniform_decode=uniform_decode,
+                    disable_full=disable_full,
+                )
+            else:
+                return self.cudagraph_dispatcher.dispatch(
+                    num_tokens=num_tokens,
+                    has_lora=has_lora,
+                    uniform_decode=uniform_decode,
+                    valid_modes=valid_modes,
+                    invalid_modes={CUDAGraphMode.FULL} if disable_full else None,
+                )
+
         cudagraph_mode, batch_descriptor = dispatch_cudagraph(num_tokens_padded, use_cascade_attn or has_encoder_output)
         num_tokens_padded = batch_descriptor.num_tokens
         if enable_sp(self.vllm_config):
@@ -1855,10 +1867,16 @@ class NPUModelRunner(GPUModelRunner):
                 dp_rank = self.parallel_config.data_parallel_rank
                 num_tokens_padded = int(num_tokens_across_dp[dp_rank].item())
                 # Re-dispatch with DP padding
-                cudagraph_mode, batch_descriptor = dispatch_cudagraph(
-                    num_tokens_padded,
-                    disable_full=synced_cudagraph_mode <= CUDAGraphMode.PIECEWISE.value,
-                )
+                if vllm_version_is("0.16.0"):
+                    cudagraph_mode, batch_descriptor = dispatch_cudagraph(
+                        num_tokens_padded,
+                        disable_full=synced_cudagraph_mode <= CUDAGraphMode.PIECEWISE.value,
+                    )
+                else:
+                    cudagraph_mode, batch_descriptor = dispatch_cudagraph(
+                        num_tokens_padded,
+                        valid_modes={CUDAGraphMode(synced_cudagraph_mode)},
+                    )
                 # Assert to make sure the agreed upon token count is correct otherwise
                 # num_tokens_across_dp will no-longer be valid
                 assert batch_descriptor.num_tokens == num_tokens_padded
@@ -2354,7 +2372,6 @@ class NPUModelRunner(GPUModelRunner):
             if is_profile and self.dynamic_eplb:
                 self.model.clear_all_moe_loads()
             if self.dynamic_eplb:
-                self.eplb_updator.take_update_info_from_eplb_process()
                 self.eplb_updator.forward_end()
             return hidden_states, hidden_states
 

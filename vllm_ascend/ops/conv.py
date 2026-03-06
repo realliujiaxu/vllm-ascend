@@ -13,13 +13,20 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#
 
-import os
 
-import vllm_ascend.patch.platform.patch_distributed  # noqa
-import vllm_ascend.patch.platform.patch_fusion_matcher_compat_ops  # noqa
-import vllm_ascend.patch.platform.patch_mamba_config  # noqa
-import vllm_ascend.patch.platform.patch_sched_yield  # noqa
+import torch
+from vllm.model_executor.layers.conv import Conv2dLayer, Conv3dLayer
 
-if os.getenv("DYNAMIC_EPLB", "false").lower() in ("true", "1") or os.getenv("EXPERT_MAP_RECORD", "false") == "true":
-    import vllm_ascend.patch.platform.patch_multiproc_executor  # noqa
+
+class AscendConv2dLayer(Conv2dLayer):
+    def forward_oot(self, x: torch.Tensor) -> torch.Tensor:
+        # Use aclnn BatchMatMulV2 for better performance on Ascend NPU.
+        return self._forward_conv(x)
+
+
+class AscendConv3dLayer(Conv3dLayer):
+    def forward_oot(self, x: torch.Tensor) -> torch.Tensor:
+        # Use aclnn BatchMatMulV2 for better performance on Ascend NPU.
+        return self._forward_conv(x)

@@ -58,6 +58,7 @@ from vllm_ascend.utils import (
     enable_sp,
     get_ascend_device_type,
     register_ascend_customop,
+    vllm_version_is,
 )
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
@@ -524,9 +525,12 @@ class NPUWorker(WorkerBase):
             )
 
         if is_start:
-            from vllm.distributed.utils import get_worker_rank_suffix
+            if vllm_version_is("0.16.0"):
+                rank_suffix = f"rank{self.rank}"
+            else:
+                from vllm.distributed.utils import get_worker_rank_suffix
 
-            rank_suffix = get_worker_rank_suffix(global_rank=self.rank)
+                rank_suffix = get_worker_rank_suffix(global_rank=self.rank)
             trace_name = f"{profile_prefix}_{rank_suffix}" if profile_prefix else rank_suffix
 
             if self.profiler is None:

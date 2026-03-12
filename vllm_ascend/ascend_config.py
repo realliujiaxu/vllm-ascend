@@ -213,11 +213,9 @@ class AscendConfig:
             from vllm_ascend.utils import is_moe_model
 
             if vllm_config.compilation_config.pass_config.enable_sp and not is_moe_model(vllm_config):
-                from vllm_ascend.compilation.passes.sequence_parallelism import get_sp_threshold
-
-                sp_threshold = get_sp_threshold(vllm_config)
-                new_compile_ranges_split_points.append(sp_threshold)
-                logger.debug(f"add {sp_threshold} to compile_ranges_split_points for sequence parallelism")
+                sp_min_token_num = vllm_config.compilation_config.pass_config.sp_min_token_num
+                new_compile_ranges_split_points.append(sp_min_token_num)
+                logger.debug(f"add {sp_min_token_num} to compile_ranges_split_points for sequence parallelism")
             if len(new_compile_ranges_split_points) > len(vllm_config.compilation_config.compile_ranges_split_points):
                 new_compile_ranges_split_points = sorted(new_compile_ranges_split_points)
                 vllm_config.compilation_config.compile_ranges_split_points = new_compile_ranges_split_points

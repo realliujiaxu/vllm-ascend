@@ -52,11 +52,12 @@ class AscendConfig:
         self.dump_config_path = additional_config.get("dump_config_path", None)
         self._construct_weight_prefetch_config(additional_config)
         self.layer_sharding = additional_config.get("layer_sharding", None)
-        logger.info_once(
-            f"Linear layer sharding enabled with config: {self.layer_sharding}. "
-            "Note: This feature works optimally with FLASHCOMM2 and DSA-CP enabled; "
-            "using it without these features may result in significant performance degradation."
-        )
+        if self.layer_sharding:
+            logger.info_once(
+                f"Linear layer sharding enabled with config: {self.layer_sharding}. "
+                "Note: This feature works optimally with FLASHCOMM2 and DSA-CP enabled; "
+                "using it without these features may result in significant performance degradation."
+            )
 
         self.enable_shared_expert_dp = (
             additional_config.get("enable_shared_expert_dp", False)
@@ -133,15 +134,33 @@ class AscendConfig:
             bool(additional_config.get("enable_async_exponential", False)) and not vllm_is_batch_invariant()
         )
 
+        use_sparse = hasattr(vllm_config.model_config, "hf_text_config") and hasattr(
+            vllm_config.model_config.hf_text_config, "index_topk"
+        )
+
         self.enable_kv_nz = additional_config.get("enable_kv_nz", False)
         if self.enable_kv_nz:
-            use_sparse = hasattr(vllm_config.model_config.hf_text_config, "index_topk")
             if not vllm_config.model_config.is_deepseek_mla or use_sparse:
                 raise RuntimeError("enable_kv_nz is only supported for mla currently.")
             if vllm_config.kv_transfer_config is None or not vllm_config.kv_transfer_config.is_kv_consumer:
                 raise NotImplementedError(
                     "enable_kv_nz is only supported in pd scenario and can only be used in D node."
                 )
+
+        from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
+
+        # Disable Sparse C8 for A5
+        # A5 has not been fully validated for this path and may carry hidden risks.
+        # TODO(rjg-lyh): Enable A5 support after sufficient validation.
+        self.enable_sparse_c8 = (
+            additional_config.get("enable_sparse_c8", False)
+            and use_sparse
+            and get_ascend_device_type() != AscendDeviceType.A5
+        )
+
+        self.enable_sp_by_pass = (
+            not vllm_config.model_config.enforce_eager and vllm_config.compilation_config.pass_config.enable_sp
+        )
 
     def _construct_weight_prefetch_config(self, additional_config):
         weight_prefetch_config = additional_config.get("weight_prefetch_config", {})
@@ -198,11 +217,9 @@ class AscendConfig:
             from vllm_ascend.utils import is_moe_model
 
             if vllm_config.compilation_config.pass_config.enable_sp and not is_moe_model(vllm_config):
-                from vllm_ascend.compilation.passes.sequence_parallelism import get_sp_threshold
-
-                sp_threshold = get_sp_threshold(vllm_config)
-                new_compile_ranges_split_points.append(sp_threshold)
-                logger.debug(f"add {sp_threshold} to compile_ranges_split_points for sequence parallelism")
+                sp_min_token_num = vllm_config.compilation_config.pass_config.sp_min_token_num
+                new_compile_ranges_split_points.append(sp_min_token_num)
+                logger.debug(f"add {sp_min_token_num} to compile_ranges_split_points for sequence parallelism")
             if len(new_compile_ranges_split_points) > len(vllm_config.compilation_config.compile_ranges_split_points):
                 new_compile_ranges_split_points = sorted(new_compile_ranges_split_points)
                 vllm_config.compilation_config.compile_ranges_split_points = new_compile_ranges_split_points

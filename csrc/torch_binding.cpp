@@ -42,6 +42,7 @@
 #include "moe_gating_top_k/moe_gating_top_k_torch_adpt.h"
 #include "moe_init_routing_custom/moe_init_routing_custom_torch_adpt.h"
 #include "sparse_flash_attention/sparse_flash_attention_torch_adpt.h"
+#include "lightning_indexer_quant/lightning_indexer_quant_torch_adpt.h"
 #include <c10/core/Device.h>
 #include <c10/util/Exception.h>
 #include <c10/util/Logging.h>
@@ -553,6 +554,34 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> dispatch_prefill(
     return {expandx_out, expand_idx_out, recv_count, num_recv_tokens_per_expert};
 }
 
+std::tuple<at::Tensor, at::Tensor> npu_gemma_rms_norm(
+    const at::Tensor& x,
+    const at::Tensor& gamma,
+    double epsilon)
+{
+    int64_t dim_x = x.dim();
+    int64_t dim_gamma = gamma.dim();
+    int64_t diff = dim_x - dim_gamma;
+    std::vector<int64_t> new_shape;
+    at::Tensor rstd;
+    if (diff > 0) {
+        new_shape.reserve(dim_x);
+        auto x_sizes = x.sizes();
+        for (int64_t i = 0; i < diff; ++i) {
+            new_shape.push_back(x_sizes[i]);
+        }
+        for (int64_t i = 0; i < dim_gamma; ++i) {
+            new_shape.push_back(1);
+        }
+    } else {
+        new_shape.assign(dim_x, 1);
+    }
+    rstd = at::empty(new_shape, x.options().dtype(at::kFloat));
+    at::Tensor y = at::empty(x.sizes(), x.options());
+    EXEC_NPU_CMD(aclnnGemmaRmsNorm, x, gamma, epsilon, y, rstd);
+    return std::tuple<at::Tensor, at::Tensor>(y, rstd);
+}
+
 void transpose_kv_cache_by_block(
     const at::TensorList &kCache,
     const at::TensorList &vCache,
@@ -569,12 +598,125 @@ void transpose_kv_cache_by_block(
 
 }
 
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+npu_copy_and_expand_eagle_inputs(
+    const at::Tensor &target_token_ids,
+    const at::Tensor &target_positions,
+    const at::Tensor &next_token_ids,
+    const at::Tensor &query_start_loc,
+    const at::Tensor &query_end_loc,
+    int64_t padding_token_id,
+    int64_t parallel_drafting_token_id,
+    int64_t num_padding_slots_per_request,
+    bool shift_input_ids,
+    int64_t total_draft_tokens)
+{
+    int64_t total_input_tokens = target_token_ids.size(0);
+    int64_t num_reqs = query_start_loc.size(0) - 1;
+
+    auto device = target_token_ids.device();
+    at::Tensor out_input_ids = at::empty({total_draft_tokens}, at::dtype(at::kInt).device(device));
+    at::Tensor out_positions = at::empty({total_draft_tokens}, at::dtype(at::kInt).device(device));
+    at::Tensor out_is_rejected_token_mask = at::empty({total_draft_tokens}, at::dtype(at::kChar).device(device));
+    at::Tensor out_is_masked_token_mask = at::empty({total_draft_tokens}, at::dtype(at::kChar).device(device));
+    at::Tensor out_new_token_indices = at::empty({num_reqs * num_padding_slots_per_request}, at::dtype(at::kInt).device(device));
+    at::Tensor out_hidden_state_mapping = at::empty({total_input_tokens}, at::dtype(at::kInt).device(device));
+
+    EXEC_NPU_CMD(aclnnCopyAndExpandEagleInputs,
+        target_token_ids, target_positions, next_token_ids, query_start_loc, query_end_loc,
+        padding_token_id, parallel_drafting_token_id, num_padding_slots_per_request,
+        shift_input_ids, total_input_tokens,
+        out_input_ids, out_positions, out_is_rejected_token_mask, out_is_masked_token_mask,
+        out_new_token_indices, out_hidden_state_mapping);
+
+    return {out_input_ids, out_positions, out_is_rejected_token_mask, out_is_masked_token_mask,
+            out_new_token_indices, out_hidden_state_mapping};
+}
+
+at::Tensor causal_conv1d_fn(
+    const at::Tensor& mixed_qkv_non_spec_T,
+    const at::Tensor& conv_weights,
+    const c10::optional<at::Tensor>& bias_opt,
+    c10::string_view activation, 
+    const at::Tensor& conv_state,
+    const at::Tensor&  has_initial_state,
+    const at::Tensor& non_spec_state_indices_tensor,
+    const at::Tensor& non_spec_query_start_loc,
+    int64_t  pad_slot_id)
+{
+    at::Tensor x=mixed_qkv_non_spec_T; //不需要转置
+    at::Tensor weight=conv_weights;//不需要转置
+    c10::optional<at::Tensor> biasOptional =bias_opt;
+    at::Tensor convStates= conv_state;
+    at::Tensor queryStartLoc=non_spec_query_start_loc;
+    at::Tensor cacheIndices=non_spec_state_indices_tensor;
+    at::Tensor hasInitialState=has_initial_state;
+    int64_t activationMode=(activation.empty()?0:1);
+    int64_t padSlotId=pad_slot_id;
+
+    at::Tensor output = at::empty(mixed_qkv_non_spec_T.sizes(), mixed_qkv_non_spec_T.options());
+    EXEC_NPU_CMD(aclnnCausalConv1d,
+                    x,                 
+                    weight,
+                    biasOptional,                  
+                    convStates,             
+                    queryStartLoc,                     
+                    cacheIndices,
+                    hasInitialState,  
+                    activationMode,    
+                    padSlotId,            
+                    output
+                ); 
+
+    return output;
+}
+  
+// It is expected that further improvements will be made after it is incorporated into CANN on June 30th.
+std::vector<at::Tensor> moe_grouped_matmul(
+    at::Tensor x,
+    at::Tensor weight,
+    const at::Tensor& group_list,
+    int64_t split_item,
+    int64_t group_type,
+    int64_t group_list_type
+)
+{
+    bool transpose_weight = false;
+    bool weight_nz = true;
+
+    at::TensorList x_list = at::TensorList(x);
+    at::TensorList weight_list = at::TensorList(weight);
+    std::vector<at::Tensor> y;
+    c10::TensorOptions options = x_list[0].options().dtype(x[0].scalar_type());
+    auto m = x_list[0].sizes()[0];
+    auto n = weight_list[0].sizes()[1];
+    if (!transpose_weight) {
+        n = weight_list[0].sizes()[2];
+    }
+    at::Tensor y_0 = at::empty(at::IntArrayRef{m, n}, options);
+    y.emplace_back(y_0);
+    at::TensorList result = at::TensorList(y);
+
+    EXEC_NPU_CMD(aclnnMoeGroupedMatmulWeightNz,
+                x_list, weight_list, group_list, transpose_weight, result);
+
+    return y;
+}
+
 } // namespace vllm_ascend
 
 TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
 {
 
     // vLLM-Ascend custom ops
+    // Gemma RmsNorm
+    ops.def(
+        "npu_gemma_rms_norm(Tensor x, "
+                            "Tensor gamma, "
+                            "float epsilon=1e-6)"
+        "-> (Tensor y ,Tensor rstd)"
+        );
+    ops.impl("npu_gemma_rms_norm", torch::kPrivateUse1, &vllm_ascend::npu_gemma_rms_norm);
     ops.def("weak_ref_tensor(Tensor input) -> Tensor");
     ops.impl("weak_ref_tensor", torch::kPrivateUse1, &vllm_ascend::weak_ref_tensor);
 
@@ -743,4 +885,50 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "transpose_kv_cache_by_block(Tensor[] kCache, Tensor[] vCache, Tensor blockIDs, int blockSize, int headNum, int headDim, int splitNum, int layerNum) -> ()"
     );
     ops.impl("transpose_kv_cache_by_block", torch::kPrivateUse1, &vllm_ascend::transpose_kv_cache_by_block);
+
+    ops.def(
+        "npu_copy_and_expand_eagle_inputs(Tensor target_token_ids, Tensor target_positions, "
+        "Tensor next_token_ids, Tensor query_start_loc, Tensor query_end_loc, "
+        "int padding_token_id, int parallel_drafting_token_id, int num_padding_slots_per_request, "
+        "bool shift_input_ids, int total_draft_tokens) -> "
+        "(Tensor out_input_ids, Tensor out_positions, Tensor out_is_rejected_token_mask, "
+        "Tensor out_is_masked_token_mask, Tensor out_new_token_indices, Tensor out_hidden_state_mapping)"
+    );
+    ops.impl("npu_copy_and_expand_eagle_inputs", torch::kPrivateUse1, &vllm_ascend::npu_copy_and_expand_eagle_inputs);
+    // causal_conv1d_fn    
+    ops.def(
+        "causal_conv1d_fn(Tensor mixed_qkv_non_spec_T, "
+        "                         Tensor conv_weights, "
+        "                         Tensor? bias_opt, "
+        "                         str activation, "
+        "                         Tensor conv_state, "
+        "                         Tensor has_initial_state, "
+        "                         Tensor non_spec_state_indices_tensor, "
+        "                         Tensor non_spec_query_start_loc, "
+        "                         int pad_slot_id) -> (Tensor output)");
+    ops.impl("causal_conv1d_fn", torch::kPrivateUse1, &vllm_ascend::causal_conv1d_fn);
+    ops.def(
+        "moe_grouped_matmul("
+            "Tensor x,"
+            "Tensor weight,"
+            "Tensor group_list,"
+            "int split_item,"
+            "int group_type,"
+            "int group_list_type)"
+
+        "-> Tensor[]"
+    );
+    ops.impl("moe_grouped_matmul", torch::kPrivateUse1,&vllm_ascend::moe_grouped_matmul);
+
+    // This operator is planned to be integrated into PTA in the near future.
+    // Once that happens, the implementation in csrc will be removed.
+    ops.def(
+        "npu_lightning_indexer_quant(Tensor query, Tensor key, Tensor weights, Tensor query_dequant_scale, "
+        "                            Tensor key_dequant_scale, *, Tensor? actual_seq_lengths_query=None, "
+        "                            Tensor? actual_seq_lengths_key=None, Tensor? block_table=None, "
+        "                            int query_quant_mode=0, int key_quant_mode=0, "
+        "                            str layout_query='BSND', str layout_key='BSND',"
+        "                            int sparse_count=2048, int sparse_mode=3) -> Tensor"
+    );
+    ops.impl("npu_lightning_indexer_quant", torch::kPrivateUse1, &vllm_ascend::npu_lightning_indexer_quant);
 }

@@ -19,11 +19,10 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
 import torch
-from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.fused_moe import FusedMoEConfig
 
 import vllm_ascend.envs as envs_ascend
-from vllm_ascend.ascend_forward_context import MoECommType
+from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
 from vllm_ascend.ops.fused_moe.moe_mlp import unified_apply_mlp
 from vllm_ascend.ops.fused_moe.prepare_finalize import (
     PrepareAndFinalize,
@@ -70,7 +69,7 @@ class FusedExpertsResult:
     before_dispatch_evt: torch.npu.Event | None = None
     before_combine_evt: torch.npu.Event | None = None
     # For dynamic_eplb
-    group_list_type: int | None = None
+    group_list_type: int = 1
     expert_tokens: torch.Tensor | None = None
 
 
@@ -135,7 +134,7 @@ class MoECommMethod(ABC):
         # Check constraints
         assert hidden_states.dtype in [torch.float32, torch.float16, torch.bfloat16, torch.int8]
 
-        moe_comm_method = get_forward_context().moe_comm_method
+        moe_comm_method = _EXTRA_CTX.moe_comm_method
         assert moe_comm_method is not None, "Missing communication context"
 
         before_dispatch_evt = torch.npu.current_stream().record_event()
@@ -355,7 +354,6 @@ class FusedMC2CommImpl(MoECommMethod):
         if log2phy is not None:
             topk_ids = log2phy[topk_ids]
 
-        group_list_type = None
         expert_tokens = None
         if envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2 == 1:
             out = torch.empty_like(hidden_states)
@@ -375,7 +373,6 @@ class FusedMC2CommImpl(MoECommMethod):
             expert_tokens = self.expert_token_nums
         elif envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2 == 2:
             assert expert_map is not None, "expert_map cannot be None."
-            group_list_type = 1
             out, expert_tokens = torch.ops._C_ascend.dispatch_gmm_combine_decode(  # type: ignore
                 x=hidden_states,
                 expert_ids=topk_ids,
@@ -393,4 +390,4 @@ class FusedMC2CommImpl(MoECommMethod):
             )
         else:
             raise ValueError(f"Wrong value of {envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2=}")
-        return FusedExpertsResult(routed_out=out, group_list_type=group_list_type, expert_tokens=expert_tokens)
+        return FusedExpertsResult(routed_out=out, expert_tokens=expert_tokens)

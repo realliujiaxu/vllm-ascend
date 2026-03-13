@@ -158,6 +158,10 @@ class AscendConfig:
             and get_ascend_device_type() != AscendDeviceType.A5
         )
 
+        self.enable_sp_by_pass = (
+            not vllm_config.model_config.enforce_eager and vllm_config.compilation_config.pass_config.enable_sp
+        )
+
     def _construct_weight_prefetch_config(self, additional_config):
         weight_prefetch_config = additional_config.get("weight_prefetch_config", {})
         self.weight_prefetch_config = WeightPrefetchConfig(weight_prefetch_config)

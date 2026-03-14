@@ -59,3 +59,49 @@ def test_qwen3_vl_sp_tp2(model: str) -> None:
         name_0="no_sp_outputs",
         name_1="sp_outputs",
     )
+
+
+@pytest.mark.parametrize("model", MODELS)
+def test_qwen3_vl_sp_npugraph_ex_tp2(model: str) -> None:
+    """Verify SP produces same output with npugraph_ex enabled and disabled."""
+    prompts = [
+        "Hello, my name is",
+        "The capital of the United States is",
+    ]
+    sampling_params = SamplingParams(max_tokens=10, temperature=0.0)
+
+    with VllmRunner(
+        model,
+        max_model_len=1024,
+        tensor_parallel_size=2,
+        compilation_config={
+            "cudagraph_capture_sizes": [2, 4],
+            "cudagraph_mode": "FULL_DECODE_ONLY",
+            "pass_config": {"enable_sp": True, "sp_min_token_num": 10},
+        },
+        additional_config={"ascend_compilation_config": {"enable_npugraph_ex": False}},
+    ) as runner:
+        sp_no_npugraph_ex_outputs = runner.model.generate(prompts, sampling_params)
+
+    with VllmRunner(
+        model,
+        max_model_len=1024,
+        tensor_parallel_size=2,
+        compilation_config={
+            "cudagraph_capture_sizes": [2, 4],
+            "cudagraph_mode": "FULL_DECODE_ONLY",
+            "pass_config": {"enable_sp": True, "sp_min_token_num": 10},
+        },
+        additional_config={"ascend_compilation_config": {"enable_npugraph_ex": True}},
+    ) as runner:
+        sp_npugraph_ex_outputs = runner.model.generate(prompts, sampling_params)
+
+    no_npugraph_ex_list = [(o.outputs[0].index, o.outputs[0].text) for o in sp_no_npugraph_ex_outputs]
+    npugraph_ex_list = [(o.outputs[0].index, o.outputs[0].text) for o in sp_npugraph_ex_outputs]
+
+    check_outputs_equal(
+        outputs_0_lst=no_npugraph_ex_list,
+        outputs_1_lst=npugraph_ex_list,
+        name_0="sp_without_npugraph_ex",
+        name_1="sp_with_npugraph_ex",
+    )

@@ -34,6 +34,10 @@ class BasePattern(ABC):
     def get_extra_stream_scope_check(self):
         return extra_stream_scope_check
 
+    def get_scalar_workaround(self) -> dict | None:
+        """Override to provide scalar_workaround for patterns with scalar/symbolic inputs (e.g. num_tokens)."""
+        return None
+
     def register(self, pm_pass: PatternMatcherPass) -> None:
         # Create a unique identifier for this pattern based on class name and eps
         pattern_id = f"{self.__class__.__name__}_{self.eps}"
@@ -45,15 +49,29 @@ class BasePattern(ABC):
         pattern_fn = self.get_pattern()
         replacement_fn = self.get_replacement()
         example_inputs = self.get_inputs()
+        scalar_workaround = self.get_scalar_workaround()
 
-        pm.register_replacement(pattern_fn, replacement_fn, example_inputs, pm.fwd_only, pm_pass)
+        if scalar_workaround is not None:
+            pm.register_replacement(
+                pattern_fn,
+                replacement_fn,
+                example_inputs,
+                pm.fwd_only,
+                pm_pass,
+                scalar_workaround=scalar_workaround,
+            )
+        else:
+            pm.register_replacement(pattern_fn, replacement_fn, example_inputs, pm.fwd_only, pm_pass)
 
-        torchair.register_replacement(
+        torchair_kwargs: dict = dict(
             search_fn=pattern_fn,
             replace_fn=replacement_fn,
             example_inputs=example_inputs,
             extra_check=self.get_extra_stream_scope_check(),
         )
+        if scalar_workaround is not None:
+            torchair_kwargs["scalar_workaround"] = scalar_workaround
+        torchair.register_replacement(**torchair_kwargs)
 
         # Mark this pattern as registered
         _registered_patterns.add(pattern_id)

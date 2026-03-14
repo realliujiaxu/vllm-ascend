@@ -1,13 +1,15 @@
 import torch
-import torch._inductor.pattern_matcher as pm
-from torch._inductor.pattern_matcher import PatternMatcherPass
+from torch._inductor.pattern_matcher import Match, PatternMatcherPass
+from vllm.compilation.passes.inductor_pass import get_pass_context
 from vllm.compilation.passes.vllm_inductor_pass import VllmInductorPass
 from vllm.config import VllmConfig
 from vllm.config.utils import Range
 from vllm.distributed import get_tensor_model_parallel_world_size, get_tp_group, tensor_model_parallel_all_reduce
 from vllm.logger import logger
 
+from vllm_ascend.compilation.passes.base_pattern import BasePattern
 from vllm_ascend.compilation.passes.noop_elimination import NoOpEliminationPass
+from vllm_ascend.compilation.passes.utils.npugraph_ex_utils_check import extra_stream_scope_check
 from vllm_ascend.utils import is_moe_model
 
 SP_MIN_TOKEN_NUM_DEFAULT = 1000
@@ -18,6 +20,16 @@ def get_sp_min_token_num(config: VllmConfig) -> int:
         return 1
 
     return SP_MIN_TOKEN_NUM_DEFAULT
+
+
+def get_sp_compile_range_and_extra_stream_check(min_tokens: int):
+    """Same pattern as allreduce_rmsnorm_fusion_pass.get_compile_range_and_extra_stream_check."""
+
+    def check_func(match: Match) -> bool:
+        compile_range = get_pass_context().compile_range
+        return extra_stream_scope_check(match) and compile_range.start >= min_tokens
+
+    return check_func
 
 
 class _SequenceParallelPatternHelper:
@@ -53,26 +65,28 @@ class _SequenceParallelPatternHelper:
         return torch.empty(*args, dtype=self.dtype, device="npu", **kws)
 
 
-class MiddleAllReduceRMSNormPattern(_SequenceParallelPatternHelper):
+class SequenceParallelBasePattern(BasePattern, _SequenceParallelPatternHelper):
+    """Base class for SP patterns that register to both Inductor and TorchAir via BasePattern."""
+
+    def __init__(self, vllm_config: VllmConfig, eps: float = 1e-6):
+        BasePattern.__init__(self, vllm_config, eps)
+        _SequenceParallelPatternHelper.__init__(self, eps, vllm_config.model_config.dtype, torch.npu.current_device())
+
+    def get_extra_stream_scope_check(self):
+        return get_sp_compile_range_and_extra_stream_check(get_sp_min_token_num(self.vllm_config))
+
+
+class MiddleAllReduceRMSNormPattern(SequenceParallelBasePattern):
     """Replaces all_reduce + AddRMSNormBias with reduce_scatter + AddRMSNormBias
     + all_gather for middle-layer sequence parallelism."""
 
-    def __init__(self, vllm_config: VllmConfig, eps: float = 1e-6):
-        super().__init__(eps, vllm_config.model_config.dtype, torch.npu.current_device())
-
-    def empty(self, *args, **kws):
-        return torch.empty(*args, dtype=self.dtype, device="npu", **kws)
-
     def get_inputs(self):
-        """
-        Generate example inputs.
-        """
         input = self.empty(8, 16)
         weight = self.empty(16)
         residual = self.empty(8, 16)
         return [input, weight, residual]
 
-    def register(self, pm_pass: PatternMatcherPass):
+    def get_pattern(self):
         def pattern(
             input: torch.Tensor,
             weight: torch.Tensor,
@@ -80,9 +94,11 @@ class MiddleAllReduceRMSNormPattern(_SequenceParallelPatternHelper):
         ) -> tuple[torch.Tensor, torch.Tensor]:
             x = self._all_reduce(input)
             result, _, residual = torch.ops._C_ascend.npu_add_rms_norm_bias(x, residual, weight, None, self.eps)
-
             return result, residual
 
+        return pattern
+
+    def get_replacement(self):
         def replacement(
             input: torch.Tensor,
             weight: torch.Tensor,
@@ -96,15 +112,12 @@ class MiddleAllReduceRMSNormPattern(_SequenceParallelPatternHelper):
             all_gather = self._all_gather(result)
             return all_gather, residual
 
-        pm.register_replacement(pattern, replacement, self.get_inputs(), pm.fwd_only, pm_pass)
+        return replacement
 
 
-class LastAllReduceRMSNormPattern(_SequenceParallelPatternHelper):
+class LastAllReduceRMSNormPattern(SequenceParallelBasePattern):
     """Same as MiddleAllReduceRMSNormPattern but for the last layer
     (no residual backprop)."""
-
-    def __init__(self, vllm_config: VllmConfig, eps: float = 1e-6):
-        super().__init__(eps, vllm_config.model_config.dtype, torch.npu.current_device())
 
     def get_inputs(self):
         input = self.empty(8, 16)
@@ -112,7 +125,7 @@ class LastAllReduceRMSNormPattern(_SequenceParallelPatternHelper):
         residual = self.empty(8, 16)
         return [input, weight, residual]
 
-    def register(self, pm_pass: PatternMatcherPass):
+    def get_pattern(self):
         def pattern(
             input: torch.Tensor,
             weight: torch.Tensor,
@@ -120,9 +133,11 @@ class LastAllReduceRMSNormPattern(_SequenceParallelPatternHelper):
         ) -> torch.Tensor:
             x = self._all_reduce(input)
             result, _, _ = torch.ops._C_ascend.npu_add_rms_norm_bias(x, residual, weight, None, self.eps)
-
             return result
 
+        return pattern
+
+    def get_replacement(self):
         def replacement(
             input: torch.Tensor,
             weight: torch.Tensor,
@@ -134,18 +149,15 @@ class LastAllReduceRMSNormPattern(_SequenceParallelPatternHelper):
             all_gather = self._all_gather(result)
             return all_gather
 
-        pm.register_replacement(pattern, replacement, self.get_inputs(), pm.fwd_only, pm_pass)
+        return replacement
 
 
-class Qwen3VLMiddleAllReduceRMSNormPattern(_SequenceParallelPatternHelper):
+class Qwen3VLMiddleAllReduceRMSNormPattern(SequenceParallelBasePattern):
     """For Qwen3-VL middle layers with hidden_states + deepstack_input_embeds add.
 
     Replaces all_reduce + add + AddRMSNormBias with reduce_scatter +
     chunk(deepstack_input_embeds) + add + AddRMSNormBias + all_gather.
     """
-
-    def __init__(self, vllm_config: VllmConfig, eps: float = 1e-6):
-        super().__init__(eps, vllm_config.model_config.dtype, torch.npu.current_device())
 
     def get_inputs(self):
         input = self.empty(8, 16)
@@ -154,7 +166,7 @@ class Qwen3VLMiddleAllReduceRMSNormPattern(_SequenceParallelPatternHelper):
         deepstack_input_embeds = self.empty(8, 16)
         return [input, weight, residual, deepstack_input_embeds]
 
-    def register(self, pm_pass: PatternMatcherPass):
+    def get_pattern(self):
         def pattern(
             input: torch.Tensor,
             weight: torch.Tensor,
@@ -164,9 +176,11 @@ class Qwen3VLMiddleAllReduceRMSNormPattern(_SequenceParallelPatternHelper):
             x = self._all_reduce(input)
             add_ = x + deepstack_input_embeds
             result, _, residual = torch.ops._C_ascend.npu_add_rms_norm_bias(add_, residual, weight, None, self.eps)
-
             return result, residual
 
+        return pattern
+
+    def get_replacement(self):
         def replacement(
             input: torch.Tensor,
             weight: torch.Tensor,
@@ -181,7 +195,7 @@ class Qwen3VLMiddleAllReduceRMSNormPattern(_SequenceParallelPatternHelper):
             all_gather = self._all_gather(result)
             return all_gather, residual
 
-        pm.register_replacement(pattern, replacement, self.get_inputs(), pm.fwd_only, pm_pass)
+        return replacement
 
 
 class SequenceParallelismPass(VllmInductorPass):

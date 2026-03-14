@@ -188,17 +188,22 @@ class AscendConfig:
     def update_compile_ranges_split_points(self):
         vllm_config = self.vllm_config
         if self.ascend_compilation_config.enable_npugraph_ex:
+            new_compile_ranges_split_points = list(vllm_config.compilation_config.compile_ranges_split_points)
             if self.ascend_compilation_config.fuse_allreduce_rms:
                 from vllm_ascend.compilation.passes.allreduce_rmsnorm_fusion_pass import ALLREDUCE_NORM_FUSE_THRESHOLD
 
-                new_compile_ranges_split_points = vllm_config.compilation_config.compile_ranges_split_points
                 new_compile_ranges_split_points.append(ALLREDUCE_NORM_FUSE_THRESHOLD)
+                logger.debug("set compile_ranges_split_points for matmul and allreduce fusion")
+
+            from vllm_ascend.utils import is_moe_model
+
+            if vllm_config.compilation_config.pass_config.enable_sp and not is_moe_model(vllm_config):
+                sp_min_token_num = vllm_config.compilation_config.pass_config.sp_min_token_num
+                new_compile_ranges_split_points.append(sp_min_token_num)
+                logger.debug(f"add {sp_min_token_num} to compile_ranges_split_points for sequence parallelism")
+            if len(new_compile_ranges_split_points) > len(vllm_config.compilation_config.compile_ranges_split_points):
                 new_compile_ranges_split_points = sorted(new_compile_ranges_split_points)
                 vllm_config.compilation_config.compile_ranges_split_points = new_compile_ranges_split_points
-                logger.debug(
-                    "set compile_ranges_split_points to "
-                    "{new_compile_ranges_split_points} for matmul and allreduce fusion"
-                )
 
         else:
             new_compile_ranges_split_points = vllm_config.compilation_config.compile_ranges_split_points

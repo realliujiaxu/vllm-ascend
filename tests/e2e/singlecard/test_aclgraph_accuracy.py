@@ -74,7 +74,7 @@ CASE_QWEN_FULL_DECODE_ONLY = LLMTestCase(
     prompts=PROMPTS_LONG,
     golden_answers=[
         " \n\nTo solve this problem, we need to use the Law of Sines and Law of Cosines. Let me start by drawing triangle $ABC$ with the",
-        " \n\nTo solve this problem, we can use the fact that the expected value of the area of a triangle with vertices on a square can be calculated by integrating over",
+        " \n\nTo solve this problem, we can use the following approach: Let $P$ be the perimeter of the square. Then, the expected value of the area",
         " \n\nTo solve this problem, we can use the following approach: Let $ \\alpha $ be the common real root of the two equations. Then, we can",
     ],
 )
@@ -85,8 +85,8 @@ CASE_DS_FULL_DECODE_ONLY = LLMTestCase(
     prompts=PROMPTS_LONG,
     golden_answers=[
         "\n\nSelect an assignment template",
-        "\n\nI'm not sure how to approach this problem. I'm not sure if I should use the law of total probability or if I should use",
-        "\n\n## Answer\n\n$a + b + c = 0$\n\nSolution\n\nLet $x$ be the common root of the equations",
+        "\n\nI'm not sure how to approach this problem. I'm thinking that the area of the triangle is $1/2$ times the area",
+        "\n\n## Answer\n\n$a + b + c = 0$\n\nSolution\n\nLet $x = \\alpha$ be the common root",
     ],
 )
 
@@ -95,7 +95,7 @@ CASE_QWEN_EX = LLMTestCase(
     prompts=PROMPTS_LONG,
     golden_answers=[
         " \n\nTo solve this problem, we need to use the Law of Sines and Law of Cosines. Let me start by drawing triangle $ABC$ with the",
-        " \n\nTo solve this problem, we can use the fact that the expected value of the area of a triangle with vertices on a square can be calculated by integrating over",
+        " \n\nTo solve this problem, we can use the following approach: Let $P$ be the perimeter of the square. Then, the expected value of the area",
         " \n\nTo solve this problem, we can use the following approach: Let $ \\alpha $ be the common real root of the two equations. Then, we can",
     ],
 )
@@ -106,8 +106,8 @@ CASE_DS_EX = LLMTestCase(
     prompts=PROMPTS_LONG,
     golden_answers=[
         "\n\nSelect an assignment template",
-        "\n\nI'm not sure how to approach this problem. I'm not sure if I should use the law of total probability or if I should use",
-        "\n\n## Answer\n\n$a + b + c = 0$\n\nSolution\n\nLet $x$ be the common root of the equations",
+        "\n\nI'm not sure how to approach this problem. I'm thinking that the area of the triangle is $1/2$ times the area",
+        "\n\n## Answer\n\n$a + b + c = 0$\n\nSolution\n\nLet $x = \\alpha$ be the common root",
     ],
 )
 

@@ -158,6 +158,16 @@ class NPUPlatform(Platform):
         return None
 
     @classmethod
+    def apply_config_platform_defaults(cls, vllm_config: VllmConfig) -> None:
+        """Apply Ascend-specific defaults. Set sp_min_token_num=1 when enable_sp and not set."""
+        pass_config = vllm_config.compilation_config.pass_config
+        if pass_config.enable_sp and pass_config.sp_min_token_num is None:
+            from vllm_ascend.compilation.passes.sequence_parallelism import get_sp_min_token_num
+
+            pass_config.sp_min_token_num = get_sp_min_token_num(vllm_config)
+            logger.info(f"set sp_min_token_num to {pass_config.sp_min_token_num}")
+
+    @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:
         return torch.npu.get_device_name(device_id)
 
@@ -173,6 +183,20 @@ class NPUPlatform(Platform):
         return torch.inference_mode()
 
     @classmethod
+    def update_block_size_for_backend(cls, vllm_config: VllmConfig) -> None:
+        cache_config = vllm_config.cache_config
+        if cache_config.user_specified_block_size:
+            # User specified --block-size; keep it.
+            return
+        model_config = vllm_config.model_config
+        if model_config is not None and model_config.is_hybrid:
+            # Hybrid attention+mamba models rely on the model-specific sizing
+            # logic rather than the generic platform default.
+            return
+
+        super().update_block_size_for_backend(vllm_config)
+
+    @classmethod
     def set_device(cls, device: torch.device):
         torch.npu.set_device(device)
 
@@ -185,6 +209,7 @@ class NPUPlatform(Platform):
 
         # initialize ascend config from vllm additional_config
         cls._fix_incompatible_config(vllm_config)
+
         ascend_config = init_ascend_config(vllm_config)
 
         if vllm_config.kv_transfer_config is not None:
@@ -205,6 +230,7 @@ class NPUPlatform(Platform):
                 if not isinstance(ascend_compilation_config, dict)
                 else ascend_compilation_config
             )
+
         ascend_config.update_compile_ranges_split_points()
 
         if model_config and hasattr(model_config.hf_text_config, "index_topk"):
@@ -224,11 +250,15 @@ class NPUPlatform(Platform):
 
         from vllm.config.compilation import CUDAGraphMode
 
-        if ascend_config.xlite_graph_config.enabled and ascend_config.xlite_graph_config.full_mode:
-            logger.info("ACLGraph is disabled under xlite full mode")
-            enforce_eager = True
-            model_config.enforce_eager = True
-            compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+        if ascend_config.xlite_graph_config.enabled:
+            if ascend_config.xlite_graph_config.full_mode:
+                logger.info("ACLGraph is disabled under xlite full mode")
+                enforce_eager = True
+                model_config.enforce_eager = True
+                compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+            else:
+                logger.info("Falling back to FULL_DECODE_ONLY under xlite decode-only mode")
+                compilation_config.cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
 
         if enforce_eager:
             logger.info("Compilation disabled, using eager mode by default")
@@ -346,7 +376,8 @@ class NPUPlatform(Platform):
 
         if parallel_config and parallel_config.worker_cls == "auto":
             # TODO: this is a tricky way to disable `use_sequence_parallel_moe` in vllm.
-            parallel_config.all2all_backend = "flashinfer_all2allv"
+            if not vllm_config.compilation_config.pass_config.enable_sp:
+                parallel_config.all2all_backend = "flashinfer_all2allv"
             if is_310p():
                 parallel_config.worker_cls = "vllm_ascend._310p.worker_310p.NPUWorker310"
             elif ascend_config.xlite_graph_config.enabled:
@@ -590,11 +621,12 @@ class NPUPlatform(Platform):
         if not envs_vllm.VLLM_USE_V2_MODEL_RUNNER:
             return {}
 
+        # is_draft_model will be removed later, so we set it to False temporarily.
+        is_draft_model = False
         moe_comm_type = select_moe_comm_method(
             num_tokens,
             vllm_config,
-            # is_draft_model will be removed later, so we set it to False temporarily.
-            is_draft_model=False,
+            is_draft_model=is_draft_model,
         )
         moe_comm_method = get_moe_comm_method(moe_comm_type)
 
@@ -621,7 +653,7 @@ class NPUPlatform(Platform):
 
         # TODO(Levi-JQ): another PR to normalize the enabling logic for sp/fc2
         flashcomm_v2_enabled = flashcomm2_enable() and tp_world_size > 1 and num_tokens is not None
-        pad_size = None
+        pad_size = 0
         padded_length = None
         if flash_comm_v1_enabled or flashcomm_v2_enabled:
             pad_size = (tp_world_size - (num_tokens % tp_world_size)) % tp_world_size
@@ -658,6 +690,7 @@ class NPUPlatform(Platform):
             "padded_length": padded_length,
             "max_tokens_across_dp": max_tokens_across_dp,
             "mc2_mask": mc2_mask,
+            "is_draft_model": is_draft_model,
         }
 
     @staticmethod
@@ -791,3 +824,7 @@ class NPUPlatform(Platform):
                     "ignored on Ascend. Resetting to default (32)."
                 )
                 att_config.flash_attn_max_num_splits_for_cuda_graph = 32
+
+    @classmethod
+    def use_custom_op_collectives(cls) -> bool:
+        return True

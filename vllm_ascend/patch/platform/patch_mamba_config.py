@@ -7,6 +7,7 @@ from vllm.model_executor.models import ModelRegistry
 from vllm.model_executor.models.config import MambaModelConfig
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE, get_dtype_size
+from vllm.v1.kv_cache_interface import MLAAttentionSpec
 
 
 @classmethod
@@ -34,10 +35,18 @@ def verify_and_update_config(cls, vllm_config) -> None:
         kv_cache_dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_config.cache_dtype]
 
     kernel_block_size = 128
-    # get attention block size
     attn_num_kv_heads = model_config.get_num_kv_heads(parallel_config)
     attn_head_size = model_config.get_head_size()
+    # Non-MLA: K-only per token for SSM alignment; full page uses ×2 below. MLA: overwrite with
+    # MLAAttentionSpec per-token bytes (no K/V split).
     attn_single_token_k_page_size = attn_head_size * attn_num_kv_heads * get_dtype_size(kv_cache_dtype)
+    if model_config.use_mla:
+        attn_single_token_k_page_size = MLAAttentionSpec(
+            block_size=1,
+            num_kv_heads=attn_num_kv_heads,
+            head_size=attn_head_size,
+            dtype=kv_cache_dtype,
+        ).page_size_bytes
 
     model_cls, _ = ModelRegistry.resolve_model_cls(
         model_config.architecture,
@@ -70,8 +79,11 @@ def verify_and_update_config(cls, vllm_config) -> None:
             attn_block_size,
         )
 
-    # compute new attention page size
-    attn_page_size = cache_config.block_size * 2 * attn_head_size * attn_num_kv_heads * get_dtype_size(kv_cache_dtype)
+    # compute new attention page size (non-MLA: K+V → ×2; MLA: attn_single_token_k_page_size is already full)
+    if model_config.use_mla:
+        attn_page_size = cache_config.block_size * attn_single_token_k_page_size
+    else:
+        attn_page_size = cache_config.block_size * 2 * attn_single_token_k_page_size
 
     # pad mamba page size for conv_blocks
     if (

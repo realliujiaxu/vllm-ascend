@@ -806,10 +806,12 @@ class AsyncKVStateScheduler(AsyncScheduler, KVStateScheduler):
         # it will also affect the scheduler output.
         self.finished_req_ids: set[str] = set()
 
+        has_structured_output_requests = False
         pending_structured_output_tokens = False
         spec_decode_tokens = scheduler_output.scheduled_spec_decode_tokens
         for req_id in scheduler_output.num_scheduled_tokens:
             request = self.requests[req_id]
+            has_structured_output_requests |= request.use_structured_output
             pending_structured_output_tokens |= (
                 request.use_structured_output
                 and request.num_output_placeholders > 0)
@@ -821,8 +823,10 @@ class AsyncKVStateScheduler(AsyncScheduler, KVStateScheduler):
                 request.num_output_placeholders += 1 + cur_num_spec_tokens
                 # Add placeholders for the new tokens in spec_token_ids.
                 # We will update the actual spec token ids in the worker process.
-                request.spec_token_ids = [0] * self.num_spec_tokens
+                request.spec_token_ids = [-1] * self.num_spec_tokens
 
+        scheduler_output.has_structured_output_requests = (
+            has_structured_output_requests)
         scheduler_output.pending_structured_output_tokens = (
             pending_structured_output_tokens)
 

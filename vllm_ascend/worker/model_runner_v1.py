@@ -1870,6 +1870,8 @@ class NPUModelRunner(GPUModelRunner):
                 attn_metadata,
                 aux_hidden_states,
             )
+            if hasattr(self, "_copy_draft_token_ids_to_cpu"):
+                self._copy_draft_token_ids_to_cpu(scheduler_output)
 
         (
             logprobs_lists,

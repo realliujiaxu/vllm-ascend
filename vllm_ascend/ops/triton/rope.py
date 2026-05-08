@@ -102,48 +102,54 @@ def _triton_rope(
             sin_row = tl.load(sin_start_ptr + cos_offsets, mask=cos_mask, other=0).to(tl.float32)
 
         # ####################################################################
-        # Load the left and right half of q and k for the current
-        # program instance (i.e. for the current token) separately
+        # Split q and k into two loops and iterate over heads in 32-head blocks.
         # ####################################################################
-        # left half of the head
-        if IS_NEOX_STYLE:
-            first_half_q_offsets = tl.arange(0, pad_n_qh)[:, None] * hd + tl.arange(0, pad_rope_dim // 2)[None, :]
-            first_half_k_offsets = tl.arange(0, pad_n_kh)[:, None] * hd + tl.arange(0, pad_rope_dim // 2)[None, :]
-        else:
-            first_half_q_offsets = tl.arange(0, pad_n_qh)[:, None] * hd + (2 * tl.arange(0, pad_rope_dim // 2)[None, :])
-            first_half_k_offsets = tl.arange(0, pad_n_kh)[:, None] * hd + (2 * tl.arange(0, pad_rope_dim // 2)[None, :])
+        rope_half_offsets = tl.arange(0, pad_rope_dim // 2)
+        rope_half_mask = rope_half_offsets < (rope_dim // 2)
+        head_offsets = tl.arange(0, BLOCK_SIZE)
 
-        first_q_mask = (tl.arange(0, pad_n_qh)[:, None] < n_qh) & (
-            tl.arange(0, pad_rope_dim // 2)[None, :] < (rope_dim // 2)
-        )
-        first_k_mask = (tl.arange(0, pad_n_kh)[:, None] < n_kh) & (
-            tl.arange(0, pad_rope_dim // 2)[None, :] < (rope_dim // 2)
-        )
-        q_tile_1 = tl.load(q_start_ptr + first_half_q_offsets, mask=first_q_mask, other=0).to(sin_row.dtype)
-        k_tile_1 = tl.load(k_start_ptr + first_half_k_offsets, mask=first_k_mask, other=0).to(sin_row.dtype)
+        # q loop
+        for q_head_start in range(0, pad_n_qh, BLOCK_SIZE):
+            q_head_idx = q_head_start + head_offsets
+            if IS_NEOX_STYLE:
+                first_half_q_offsets = q_head_idx[:, None] * hd + rope_half_offsets[None, :]
+            else:
+                first_half_q_offsets = q_head_idx[:, None] * hd + (2 * rope_half_offsets[None, :])
+            first_q_mask = (q_head_idx[:, None] < n_qh) & rope_half_mask[None, :]
+            q_tile_1 = tl.load(q_start_ptr + first_half_q_offsets, mask=first_q_mask, other=0).to(sin_row.dtype)
 
-        # right half of the head
-        if IS_NEOX_STYLE:
-            second_half_q_offsets = first_half_q_offsets + (rope_dim // 2)
-            second_half_k_offsets = first_half_k_offsets + (rope_dim // 2)
-        else:
-            second_half_q_offsets = first_half_q_offsets + 1
-            second_half_k_offsets = first_half_k_offsets + 1
-        second_q_mask = first_q_mask
-        second_k_mask = first_k_mask
-        q_tile_2 = tl.load(q_start_ptr + second_half_q_offsets, mask=second_q_mask, other=0).to(sin_row.dtype)
-        k_tile_2 = tl.load(k_start_ptr + second_half_k_offsets, mask=second_k_mask, other=0).to(sin_row.dtype)
+            if IS_NEOX_STYLE:
+                second_half_q_offsets = first_half_q_offsets + (rope_dim // 2)
+            else:
+                second_half_q_offsets = first_half_q_offsets + 1
+            q_tile_2 = tl.load(q_start_ptr + second_half_q_offsets, mask=first_q_mask, other=0).to(sin_row.dtype)
 
-        # y = [x1, x2] * [cos, cos] + [-x2, x1] * [sin, sin]
-        new_q_tile_1 = q_tile_1 * cos_row - q_tile_2 * sin_row
-        tl.store(q_start_ptr + first_half_q_offsets, new_q_tile_1, mask=first_q_mask)
-        new_q_tile_2 = q_tile_2 * cos_row + q_tile_1 * sin_row
-        tl.store(q_start_ptr + second_half_q_offsets, new_q_tile_2, mask=second_q_mask)
+            # y = [x1, x2] * [cos, cos] + [-x2, x1] * [sin, sin]
+            new_q_tile_1 = q_tile_1 * cos_row - q_tile_2 * sin_row
+            tl.store(q_start_ptr + first_half_q_offsets, new_q_tile_1, mask=first_q_mask)
+            new_q_tile_2 = q_tile_2 * cos_row + q_tile_1 * sin_row
+            tl.store(q_start_ptr + second_half_q_offsets, new_q_tile_2, mask=first_q_mask)
 
-        new_k_tile_1 = k_tile_1 * cos_row - k_tile_2 * sin_row
-        tl.store(k_start_ptr + first_half_k_offsets, new_k_tile_1, mask=first_k_mask)
-        new_k_tile_2 = k_tile_2 * cos_row + k_tile_1 * sin_row
-        tl.store(k_start_ptr + second_half_k_offsets, new_k_tile_2, mask=second_k_mask)
+        # k loop
+        for k_head_start in range(0, pad_n_kh, BLOCK_SIZE):
+            k_head_idx = k_head_start + head_offsets
+            if IS_NEOX_STYLE:
+                first_half_k_offsets = k_head_idx[:, None] * hd + rope_half_offsets[None, :]
+            else:
+                first_half_k_offsets = k_head_idx[:, None] * hd + (2 * rope_half_offsets[None, :])
+            first_k_mask = (k_head_idx[:, None] < n_kh) & rope_half_mask[None, :]
+            k_tile_1 = tl.load(k_start_ptr + first_half_k_offsets, mask=first_k_mask, other=0).to(sin_row.dtype)
+
+            if IS_NEOX_STYLE:
+                second_half_k_offsets = first_half_k_offsets + (rope_dim // 2)
+            else:
+                second_half_k_offsets = first_half_k_offsets + 1
+            k_tile_2 = tl.load(k_start_ptr + second_half_k_offsets, mask=first_k_mask, other=0).to(sin_row.dtype)
+
+            new_k_tile_1 = k_tile_1 * cos_row - k_tile_2 * sin_row
+            tl.store(k_start_ptr + first_half_k_offsets, new_k_tile_1, mask=first_k_mask)
+            new_k_tile_2 = k_tile_2 * cos_row + k_tile_1 * sin_row
+            tl.store(k_start_ptr + second_half_k_offsets, new_k_tile_2, mask=first_k_mask)
 
 
 @triton.jit
@@ -243,7 +249,7 @@ def rope_forward_triton(
     pad_rope_dim = triton.next_power_of_2(rope_dim)
     pad_n_q_head = triton.next_power_of_2(n_q_head)
     pad_n_kv_head = triton.next_power_of_2(n_kv_head)
-    BLOCK_SIZE = max(pad_n_q_head, pad_n_kv_head)
+    BLOCK_SIZE = 32
     num_vectorcore = get_vectorcore_num()
     n_row = min(num_tokens, num_vectorcore)
 

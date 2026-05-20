@@ -1168,9 +1168,9 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
                 f"key_cache is None in _get_mxfp_fia_params for mode {attn_metadata.attn_state}."
             )
 
-        num_block, block_size, _, _ = self.key_cache.shape
-        key = self.key_cache.view(num_block, block_size, -1)
-        value = self.value_cache.view(num_block, block_size, -1)
+        block_size = self.key_cache.shape[1]
+        key = self.key_cache
+        value = self.value_cache
         # K scale cache: [num_blocks, num_kv_heads, block_size, head_dim // 64, 2]
         # V scale cache: [num_blocks, num_kv_heads, block_size // 64, head_dim, 2]
         key_scale = self.key_scale_cache
@@ -1212,11 +1212,11 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         k_shape = actual_key.shape
         v_shape = actual_value.shape
         quant_key, key_scale = torch_npu.npu_dynamic_mx_quant(
-            actual_key.contiguous().view(-1, k_shape[-1]),
+            actual_key,
             dst_type=torch.float8_e4m3fn,
         )
         quant_value, value_scale = torch_npu.npu_dynamic_mx_quant(
-            actual_value.contiguous(),
+            actual_value,
             dst_type=torch.float8_e4m3fn,
             axis=0,
         )
@@ -1250,6 +1250,8 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         if self.sliding_window is not None:
             raise NotImplementedError("C8_MXFP attention does not support sliding window attention yet.")
 
+        key = key.transpose(1, 2).contiguous()
+        value = value.transpose(1, 2).contiguous()
         attn_output, _ = torch_npu.npu_fused_infer_attention_score_v2(
             query,
             key,

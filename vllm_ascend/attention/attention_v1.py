@@ -1188,12 +1188,21 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         super().__init__(*args, **kwargs)
         self._mxfp_tail_writer = MxfpTailWindowWriter()
 
+    def _ensure_mxfp_tail_writer(self) -> MxfpTailWindowWriter:
+        # kv_c8.py patches impl via ``layer.impl.__class__ = ...`` without
+        # re-running __init__, so lazily create the writer on first use.
+        writer = getattr(self, "_mxfp_tail_writer", None)
+        if writer is None:
+            self._mxfp_tail_writer = MxfpTailWindowWriter()
+            writer = self._mxfp_tail_writer
+        return writer
+
     @property
     def _tail_windows(self) -> dict:
-        return self._mxfp_tail_writer._tail_windows
+        return self._ensure_mxfp_tail_writer()._tail_windows
 
     def prune_tail_windows(self, active_req_ids: set[str]) -> None:
-        self._mxfp_tail_writer.prune_tail_windows(active_req_ids)
+        self._ensure_mxfp_tail_writer().prune_tail_windows(active_req_ids)
 
     def _quantize_kv_tensors(
         self,
@@ -1259,7 +1268,7 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
                 n_tokens,
             )
 
-        self._mxfp_tail_writer.write_batch(
+        self._ensure_mxfp_tail_writer().write_batch(
             key,
             value,
             kv_cache,

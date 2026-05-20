@@ -171,8 +171,11 @@ class AscendC8MXFPKVCacheAttentionMethod(AscendAttentionScheme):
         layer.kv_cache_torch_dtype = torch.float8_e4m3fn
         if hasattr(layer, "impl"):
             from vllm_ascend.attention.attention_v1 import AscendC8MXFPAttentionBackendImpl
+            from vllm_ascend.device.mxfp_tail_window import MxfpTailWindowWriter
 
             layer.impl.__class__ = AscendC8MXFPAttentionBackendImpl
+            if not hasattr(layer.impl, "_mxfp_tail_writer"):
+                layer.impl._mxfp_tail_writer = MxfpTailWindowWriter()
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         pass

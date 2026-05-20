@@ -66,6 +66,7 @@ from vllm_ascend.device.mxfp_compat import (
     MXFP_KV_SCALE_GROUP_SIZE,
     scatter_mxfp_v_scale_cache,
 )
+from vllm_ascend.device.mxfp_tail_window import MxfpTailWindowWriter
 from vllm_ascend.ops.flashcomm2_oshard_manager import flashcomm2_oshard_manager
 from vllm_ascend.utils import weak_ref_tensors
 from vllm_ascend.worker.kvcomp_utils import KVCompMetaData
@@ -227,6 +228,10 @@ class AscendMetadata:
 
     kvcomp_metadata: KVCompMetaData | None = None
 
+    # C8_MXFP tail-window KV write (§5): per-batch request ids and computed lengths.
+    req_ids: list[str] | None = None
+    num_computed_tokens_cpu: torch.Tensor | None = None
+
 
 class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
     """
@@ -357,6 +362,8 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
             causal=common_attn_metadata.causal,
             model_runner_type=self.model_config.runner_type,
             kvcomp_metadata=common_attn_metadata.kvcomp_metadata,
+            req_ids=getattr(common_attn_metadata, "req_ids", None),
+            num_computed_tokens_cpu=common_attn_metadata.num_computed_tokens_cpu,
         )
         return attn_metadata
 
@@ -1173,10 +1180,98 @@ class AscendAttentionBackendImpl(AttentionImpl):
 class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
     """MXFP8 KV cache backend.
 
-    In forward(), Q and K/V are quantized to FP8 E4M3 (with E8M0 scales) before
-    cache write; reshape_and_cache only scatters quantized K/V and scales into
-    paged cache, and FIA consumes them from the transposed cache layout.
+    In forward(), Q is quantized for FIA; K/V use tail-window aware cache write
+    (``_reshape_and_cache_mxfp8_with_tail_window``) then FIA reads paged cache.
     """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._mxfp_tail_writer = MxfpTailWindowWriter()
+
+    @property
+    def _tail_windows(self) -> dict:
+        return self._mxfp_tail_writer._tail_windows
+
+    def prune_tail_windows(self, active_req_ids: set[str]) -> None:
+        self._mxfp_tail_writer.prune_tail_windows(active_req_ids)
+
+    def _quantize_kv_tensors(
+        self,
+        key: torch.Tensor,
+        value: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        k_shape = key.shape
+        v_shape = value.shape
+        quant_key, key_scale = torch_npu.npu_dynamic_mx_quant(
+            key,
+            dst_type=torch.float8_e4m3fn,
+        )
+        quant_value, value_scale = torch_npu.npu_dynamic_mx_quant(
+            value,
+            dst_type=torch.float8_e4m3fn,
+            axis=0,
+        )
+        return quant_key.view(k_shape), quant_value.view(v_shape), key_scale, value_scale
+
+    def _reshape_and_cache_mxfp8_with_tail_window(
+        self,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+        attn_metadata: AscendMetadata,
+    ) -> None:
+        encoder_decoder = self.attn_type == AttentionType.ENCODER_DECODER
+        num_actual_tokens = key.shape[0] if encoder_decoder else attn_metadata.num_actual_tokens
+        if num_actual_tokens <= 0:
+            return
+        if (
+            key.shape[-1] % MXFP_KV_SCALE_GROUP_SIZE != 0
+            or value.shape[-1] % MXFP_KV_SCALE_GROUP_SIZE != 0
+        ):
+            raise ValueError(
+                f"C8_MXFP KV cache requires K/V head dims divisible by {MXFP_KV_SCALE_GROUP_SIZE}, "
+                f"got {key.shape[-1]}/{value.shape[-1]}."
+            )
+
+        block_size = kv_cache[0].shape[1]
+        slots = attn_metadata.slot_mapping
+        if not encoder_decoder:
+            key = key[:num_actual_tokens]
+            value = value[:num_actual_tokens]
+            slots = slots[:num_actual_tokens]
+
+        def _write_mxfp8(
+            quant_key: torch.Tensor,
+            quant_value: torch.Tensor,
+            key_scale: torch.Tensor,
+            value_scale: torch.Tensor,
+            cache: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+            slot_mapping: torch.Tensor,
+            n_tokens: int,
+        ) -> None:
+            self._reshape_and_cache_mxfp8(
+                quant_key,
+                quant_value,
+                key_scale,
+                value_scale,
+                cache,
+                slot_mapping,
+                n_tokens,
+            )
+
+        self._mxfp_tail_writer.write_batch(
+            key,
+            value,
+            kv_cache,
+            num_tokens=num_actual_tokens,
+            query_start_loc=attn_metadata.query_start_loc,
+            req_ids=attn_metadata.req_ids,
+            num_computed_tokens_cpu=attn_metadata.num_computed_tokens_cpu,
+            slot_mapping=slots,
+            quantize_kv=self._quantize_kv_tensors,
+            write_mxfp8=_write_mxfp8,
+            block_size=block_size,
+        )
 
     def _quantize_kv_to_mxfp8(
         self,
@@ -1534,11 +1629,8 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
             raise NotImplementedError("C8_MXFP attention does not support hamming sparse KV compression yet.")
 
         quant_query, query_scale = self._quantize_query_to_mxfp8(query, attn_metadata)
-        quant_key, quant_value, key_scale, value_scale = self._quantize_kv_to_mxfp8(
-            key, value, attn_metadata
-        )
-        self.reshape_and_cache(
-            quant_key, quant_value, key_scale, value_scale, kv_cache, attn_metadata
+        self._reshape_and_cache_mxfp8_with_tail_window(
+            key, value, kv_cache, attn_metadata
         )
 
         fia_kv_cache = self._transpose_kv_cache(kv_cache)

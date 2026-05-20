@@ -95,7 +95,11 @@ from vllm.v1.worker.utils import AttentionGroup
 
 # yapf: enable
 from vllm_ascend.ascend_config import get_ascend_config
-from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState
+from vllm_ascend.attention.attention_v1 import (
+    AscendAttentionBackend,
+    AscendAttentionState,
+    AscendC8MXFPAttentionBackendImpl,
+)
 from vllm_ascend.attention.mla_v1 import AscendMLABackend
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata, using_paged_attention
 
@@ -2534,6 +2538,16 @@ class NPUModelRunner(GPUModelRunner):
             cudagraph_stats,
         )
 
+    def _prune_c8_mxfp_tail_windows(self, num_reqs: int) -> None:
+        """Drop stale per-layer C8_MXFP tail-window state for finished requests."""
+        if num_reqs <= 0:
+            return
+        active_req_ids = set(self.input_batch.req_ids[:num_reqs])
+        for layer in self.compilation_config.static_forward_context.values():
+            impl = getattr(layer, "impl", None)
+            if isinstance(impl, AscendC8MXFPAttentionBackendImpl):
+                impl.prune_tail_windows(active_req_ids)
+
     def _build_attention_metadata(
         self,
         num_tokens: int,
@@ -2557,6 +2571,7 @@ class NPUModelRunner(GPUModelRunner):
             return {}, None
         num_tokens_padded = num_tokens_padded or num_tokens
         num_reqs_padded = num_reqs_padded or num_reqs
+        self._prune_c8_mxfp_tail_windows(num_reqs_padded)
         attn_metadata: PerLayerAttnMetadata = {}
         if ubatch_slices is not None:
             attn_metadata = [dict() for _ in range(len(ubatch_slices))]
@@ -2649,6 +2664,7 @@ class NPUModelRunner(GPUModelRunner):
             num_computed_tokens_cpu = None
 
         cm_base = AscendCommonAttentionMetadata(
+            req_ids=list(self.input_batch.req_ids[:num_reqs_padded]),
             query_start_loc=self.query_start_loc.gpu[: num_reqs_padded + 1],
             query_start_loc_cpu=self.query_start_loc.cpu[: num_reqs_padded + 1],
             seq_lens=self.seq_lens[:num_reqs_padded],

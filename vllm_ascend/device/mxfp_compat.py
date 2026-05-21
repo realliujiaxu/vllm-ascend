@@ -212,7 +212,7 @@ def scatter_mxfp_k_scale_cache(
     slot_mapping: torch.Tensor,
     block_size: int,
 ) -> None:
-    """Scatter per-token K scales into the paged K-scale cache (§4.4).
+    """Scatter per-token K scales into the paged K-scale cache.
 
     ``key_scale`` shape: ``[num_tokens, num_kv_heads, head_dim // 64, 2]``.
     ``key_scale_cache`` shape:
@@ -227,13 +227,33 @@ def scatter_mxfp_k_scale_cache(
     key_scale_cache[block_ids, :, block_offsets, :, :] = key_scale
 
 
+def scatter_mxfp_v_cache(
+    quant_value: torch.Tensor,
+    value_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    block_size: int,
+) -> None:
+    """Scatter per-token quantized V into the paged V cache.
+
+    ``quant_value`` shape: ``[num_tokens, num_kv_heads, v_dim]``.
+    ``value_cache`` shape: ``[num_blocks, block_size, num_kv_heads, v_dim]``.
+    """
+    validate_mxfp_v_scale_block_size(block_size)
+    slots = slot_mapping.to(torch.long)
+    if slots.numel() == 0:
+        return
+    block_ids = slots // block_size
+    block_offsets = slots % block_size
+    value_cache[block_ids, block_offsets, :, :] = quant_value
+
+
 def scatter_mxfp_v_scale_cache(
     value_scale: torch.Tensor,
     value_scale_cache: torch.Tensor,
     slot_mapping: torch.Tensor,
     block_size: int,
 ) -> None:
-    """Scatter per-64-token-group V scales into the paged V-scale cache (§4.5).
+    """Scatter per-64-token-group V scales into the paged V-scale cache.
 
     ``value_scale`` comes from ``npu_dynamic_mx_quant(..., axis=0)`` and has shape
     ``[ceil(num_tokens / 64), num_kv_heads, head_dim, 2]``. The cache layout is

@@ -4,6 +4,7 @@
 import unittest
 
 import torch
+import torch_npu
 
 from vllm_ascend.device.mxfp_compat import MXFP_KV_SCALE_GROUP_SIZE, scatter_mxfp_v_cache
 from vllm_ascend.device.mxfp_tail_window import MxfpTailWindowWriter
@@ -72,19 +73,24 @@ class TestMxfpTailWindowWriter(unittest.TestCase):
 
 
 class TestScatterMxfpVCache(unittest.TestCase):
+    @unittest.skipUnless(
+        hasattr(torch_npu, "npu_scatter_nd_update_") and torch.npu.is_available(),
+        "npu_scatter_nd_update_ requires NPU",
+    )
     def test_scatter_mxfp_v_cache_paged_layout(self):
         block_size = 64
         num_blocks = 2
         num_kv_heads = 2
         v_dim = 4
-        value_cache = torch.zeros(num_blocks, block_size, num_kv_heads, v_dim)
+        value_cache = torch.zeros(num_blocks, block_size, num_kv_heads, v_dim, device="npu")
         quant_value = torch.tensor(
             [
                 [[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]],
                 [[9.0, 10.0, 11.0, 12.0], [13.0, 14.0, 15.0, 16.0]],
-            ]
+            ],
+            device="npu",
         )
-        slot_mapping = torch.tensor([1, 2], dtype=torch.int64)
+        slot_mapping = torch.tensor([1, 2], dtype=torch.int64, device="npu")
 
         scatter_mxfp_v_cache(quant_value, value_cache, slot_mapping, block_size)
 

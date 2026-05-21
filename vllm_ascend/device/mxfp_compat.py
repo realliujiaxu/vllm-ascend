@@ -287,9 +287,15 @@ def scatter_mxfp_v_cache(
     slots = slot_mapping.to(torch.long)
     if slots.numel() == 0:
         return
-    block_ids = slots // block_size
-    block_offsets = slots % block_size
-    value_cache[block_ids, block_offsets, :, :] = quant_value
+
+    num_kv_heads = quant_value.shape[1]
+    v_dim = quant_value.shape[2]
+    flat_cache = value_cache.view(-1, num_kv_heads * v_dim)
+    torch_npu.npu_scatter_nd_update_(
+        flat_cache,
+        slots.view(-1, 1),
+        quant_value.reshape(quant_value.shape[0], num_kv_heads * v_dim),
+    )
 
 
 def scatter_mxfp_v_scale_cache(

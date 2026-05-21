@@ -206,22 +206,37 @@ def mxfp_get_kv_cache_layout(
     return k_shape, v_shape, k_scale_shape, v_scale_shape
 
 
+def scatter_mxfp_k_scale_cache(
+    key_scale: torch.Tensor,
+    key_scale_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    block_size: int,
+) -> None:
+    """Scatter per-token K scales into the paged K-scale cache (§4.4).
+
+    ``key_scale`` shape: ``[num_tokens, num_kv_heads, head_dim // 64, 2]``.
+    ``key_scale_cache`` shape:
+    ``[num_blocks, num_kv_heads, block_size, head_dim // 64, 2]``.
+    """
+    validate_mxfp_v_scale_block_size(block_size)
+    slots = slot_mapping.to(torch.long)
+    if slots.numel() == 0:
+        return
+    block_ids = slots // block_size
+    block_offsets = slots % block_size
+    key_scale_cache[block_ids, :, block_offsets, :, :] = key_scale
+
+
 def scatter_mxfp_v_scale_cache(
     value_scale: torch.Tensor,
     value_scale_cache: torch.Tensor,
     slot_mapping: torch.Tensor,
     block_size: int,
 ) -> None:
-    """Scatter per-batch V scales into the paged V-scale cache.
-
-    Matches ``modeling_qwen3_moe.py`` MXFP prefill slot derivation::
-
-        v_scale_slot = (kv_slot_mapping // (QUANT_BLOCK_SIZE * 2)).unique()
-
-    with ``QUANT_BLOCK_SIZE=32`` (i.e. group size 64 along the token axis).
+    """Scatter per-64-token-group V scales into the paged V-scale cache (§4.5).
 
     ``value_scale`` comes from ``npu_dynamic_mx_quant(..., axis=0)`` and has shape
-    ``[ceil(num_tokens, 64), num_kv_heads, head_dim, 2]``. The cache layout is
+    ``[ceil(num_tokens / 64), num_kv_heads, head_dim, 2]``. The cache layout is
     ``[num_blocks, num_kv_heads, block_size // 64, head_dim, 2]``.
     """
     validate_mxfp_v_scale_block_size(block_size)
@@ -230,33 +245,25 @@ def scatter_mxfp_v_scale_cache(
     if num_tokens == 0:
         return
 
-    num_scale_groups = (num_tokens + MXFP_KV_SCALE_GROUP_SIZE - 1) // MXFP_KV_SCALE_GROUP_SIZE
-    if value_scale.shape[0] != num_scale_groups:
+    num_scale_groups = value_scale.shape[0]
+    expected_scale_groups = (num_tokens + MXFP_KV_SCALE_GROUP_SIZE - 1) // MXFP_KV_SCALE_GROUP_SIZE
+    if num_scale_groups != expected_scale_groups:
         raise ValueError(
-            f"C8_MXFP value_scale batch dim mismatch: got {value_scale.shape[0]}, "
-            f"expected {num_scale_groups} for num_tokens={num_tokens}."
+            f"C8_MXFP value_scale batch dim mismatch: got {num_scale_groups}, "
+            f"expected {expected_scale_groups} for num_tokens={num_tokens}."
         )
 
-    groups_per_block = mxfp_kv_block_scale_groups(block_size)
-    write_group_ids = torch.arange(num_tokens, device=slots.device, dtype=torch.long)
-    write_group_ids = write_group_ids // MXFP_KV_SCALE_GROUP_SIZE
-    slot_groups = slots // MXFP_KV_SCALE_GROUP_SIZE
-
-    sort_idx = torch.argsort(slot_groups, stable=True)
-    sorted_groups = slot_groups[sort_idx]
-    sorted_write_groups = write_group_ids[sort_idx]
-    unique_mask = torch.cat(
-        (
-            torch.tensor([True], device=slots.device),
-            sorted_groups[1:] != sorted_groups[:-1],
+    v_scale_slot_mapping = (slots // MXFP_KV_SCALE_GROUP_SIZE).unique()
+    if v_scale_slot_mapping.numel() != num_scale_groups:
+        raise ValueError(
+            f"C8_MXFP V scale slot mapping mismatch: got {v_scale_slot_mapping.numel()} "
+            f"unique slot groups for num_tokens={num_tokens}, expected {num_scale_groups}."
         )
-    )
-    unique_slot_groups = sorted_groups[unique_mask]
-    unique_write_groups = sorted_write_groups[unique_mask]
 
-    block_ids = unique_slot_groups // groups_per_block
-    cache_group_ids = unique_slot_groups % groups_per_block
-    value_scale_cache[block_ids, :, cache_group_ids, :, :] = value_scale[unique_write_groups]
+    v_scale_cache_block_size = mxfp_kv_block_scale_groups(block_size)
+    block_ids = v_scale_slot_mapping // v_scale_cache_block_size
+    v_scale_cache_offsets = v_scale_slot_mapping % v_scale_cache_block_size
+    value_scale_cache[block_ids, :, v_scale_cache_offsets, :, :] = value_scale
 
 
 # Backward-compatible aliases.

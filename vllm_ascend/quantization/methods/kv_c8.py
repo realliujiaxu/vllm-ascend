@@ -174,8 +174,10 @@ class AscendC8MXFPKVCacheAttentionMethod(AscendAttentionScheme):
             from vllm_ascend.device.mxfp_tail_window import MxfpTailWindowWriter
 
             layer.impl.__class__ = AscendC8MXFPAttentionBackendImpl
+            # Class surgery skips __init__; attach tail-window buffers explicitly.
             if not hasattr(layer.impl, "_mxfp_tail_writer"):
-                layer.impl._mxfp_tail_writer = MxfpTailWindowWriter()
+                max_num_seqs = layer.impl.vllm_config.scheduler_config.max_num_seqs
+                layer.impl._mxfp_tail_writer = MxfpTailWindowWriter(max_num_seqs=max_num_seqs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         pass

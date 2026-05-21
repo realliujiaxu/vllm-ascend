@@ -2539,14 +2539,21 @@ class NPUModelRunner(GPUModelRunner):
         )
 
     def _prune_c8_mxfp_tail_windows(self, num_reqs: int) -> None:
-        """Drop stale per-layer C8_MXFP tail-window state for finished requests."""
+        """Drop stale per-layer C8_MXFP tail-window rows for finished batch slots.
+
+        Tail buffers are indexed by batch row (like ``block_table``), so when a
+        request leaves the persistent batch we zero rows ``[num_reqs, max_num_seqs)``.
+        """
         if num_reqs <= 0:
+            for layer in self.compilation_config.static_forward_context.values():
+                impl = getattr(layer, "impl", None)
+                if isinstance(impl, AscendC8MXFPAttentionBackendImpl):
+                    impl.prune_tail_windows(0)
             return
-        active_req_ids = set(self.input_batch.req_ids[:num_reqs])
         for layer in self.compilation_config.static_forward_context.values():
             impl = getattr(layer, "impl", None)
             if isinstance(impl, AscendC8MXFPAttentionBackendImpl):
-                impl.prune_tail_windows(active_req_ids)
+                impl.prune_tail_windows(num_reqs)
 
     def _build_attention_metadata(
         self,

@@ -1186,23 +1186,23 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        self._mxfp_tail_writer = MxfpTailWindowWriter()
+        # One writer per layer; row count matches scheduler max concurrent requests.
+        max_num_seqs = self.vllm_config.scheduler_config.max_num_seqs
+        self._mxfp_tail_writer = MxfpTailWindowWriter(max_num_seqs=max_num_seqs)
 
     def _ensure_mxfp_tail_writer(self) -> MxfpTailWindowWriter:
         # kv_c8.py patches impl via ``layer.impl.__class__ = ...`` without
         # re-running __init__, so lazily create the writer on first use.
         writer = getattr(self, "_mxfp_tail_writer", None)
         if writer is None:
-            self._mxfp_tail_writer = MxfpTailWindowWriter()
+            max_num_seqs = self.vllm_config.scheduler_config.max_num_seqs
+            self._mxfp_tail_writer = MxfpTailWindowWriter(max_num_seqs=max_num_seqs)
             writer = self._mxfp_tail_writer
         return writer
 
-    @property
-    def _tail_windows(self) -> dict:
-        return self._ensure_mxfp_tail_writer()._tail_windows
-
-    def prune_tail_windows(self, active_req_ids: set[str]) -> None:
-        self._ensure_mxfp_tail_writer().prune_tail_windows(active_req_ids)
+    def prune_tail_windows(self, num_active_reqs: int) -> None:
+        """Clear tail-window rows for batch slots ``>= num_active_reqs``."""
+        self._ensure_mxfp_tail_writer().prune_tail_windows(num_active_reqs)
 
     def _quantize_kv_tensors(
         self,
@@ -1211,6 +1211,7 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         k_shape = key.shape
         v_shape = value.shape
+        # K: per-token scale along head_dim groups; V: one scale per up-to-64 rows.
         quant_key, key_scale = torch_npu.npu_dynamic_mx_quant(
             key,
             dst_type=torch.float8_e4m3fn,
@@ -1229,8 +1230,18 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         kv_cache: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
         attn_metadata: AscendMetadata,
     ) -> None:
-        encoder_decoder = self.attn_type == AttentionType.ENCODER_DECODER
-        num_actual_tokens = key.shape[0] if encoder_decoder else attn_metadata.num_actual_tokens
+        """Write bf16 K/V to MXFP8 cache with per-request tail-group handling.
+
+        Full 64-token V-scale groups are quantized and written directly.  Shorter
+        tail segments are accumulated in ``MxfpTailWindowWriter`` (indexed by
+        batch slot via ``query_start_loc``) and re-written on every append.
+        """
+        if self.attn_type == AttentionType.ENCODER_DECODER:
+            raise NotImplementedError(
+                "C8_MXFP tail-window KV cache write does not support encoder-decoder attention."
+            )
+
+        num_actual_tokens = attn_metadata.num_actual_tokens
         if num_actual_tokens <= 0:
             return
         if (
@@ -1243,11 +1254,9 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
             )
 
         block_size = kv_cache[0].shape[1]
-        slots = attn_metadata.slot_mapping
-        if not encoder_decoder:
-            key = key[:num_actual_tokens]
-            value = value[:num_actual_tokens]
-            slots = slots[:num_actual_tokens]
+        slots = attn_metadata.slot_mapping[:num_actual_tokens]
+        key = key[:num_actual_tokens]
+        value = value[:num_actual_tokens]
 
         def _write_mxfp8(
             quant_key: torch.Tensor,
@@ -1274,7 +1283,6 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
             kv_cache,
             num_tokens=num_actual_tokens,
             query_start_loc=attn_metadata.query_start_loc,
-            req_ids=attn_metadata.req_ids,
             num_computed_tokens_cpu=attn_metadata.num_computed_tokens_cpu,
             slot_mapping=slots,
             quantize_kv=self._quantize_kv_tensors,
@@ -1288,13 +1296,14 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         value: torch.Tensor,
         attn_metadata: AscendMetadata,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        encoder_decoder = self.attn_type == AttentionType.ENCODER_DECODER
-        if encoder_decoder:
-            actual_key, actual_value = key, value
-        else:
-            num_actual_tokens = attn_metadata.num_actual_tokens
-            actual_key = key[:num_actual_tokens]
-            actual_value = value[:num_actual_tokens]
+        if self.attn_type == AttentionType.ENCODER_DECODER:
+            raise NotImplementedError(
+                "C8_MXFP KV cache quantization does not support encoder-decoder attention."
+            )
+
+        num_actual_tokens = attn_metadata.num_actual_tokens
+        actual_key = key[:num_actual_tokens]
+        actual_value = value[:num_actual_tokens]
         if (
             actual_key.shape[-1] % MXFP_KV_SCALE_GROUP_SIZE != 0
             or actual_value.shape[-1] % MXFP_KV_SCALE_GROUP_SIZE != 0
@@ -1601,10 +1610,14 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         kv_cache: tuple[torch.Tensor],
         attn_metadata: AscendMetadata,
     ) -> None:
+        if self.attn_type == AttentionType.ENCODER_DECODER:
+            raise NotImplementedError(
+                "C8_MXFP reshape_and_cache does not support encoder-decoder attention."
+            )
+
         slots = attn_metadata.slot_mapping
-        encoder_decoder = self.attn_type == AttentionType.ENCODER_DECODER
         num_actual_tokens = quant_key.shape[0]
-        cache_slots = slots[:num_actual_tokens] if not encoder_decoder else slots.to(torch.int32)
+        cache_slots = slots[:num_actual_tokens]
         self._reshape_and_cache_mxfp8(
             quant_key,
             quant_value,

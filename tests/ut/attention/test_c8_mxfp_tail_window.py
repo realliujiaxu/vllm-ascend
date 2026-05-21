@@ -198,16 +198,13 @@ def _write_once(
     kv_cache: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
     *,
     g0: int,
-    req_id: str = "req-0",
 ) -> None:
-    positions = torch.arange(k.shape[0], dtype=torch.long) + g0
     writer.write_batch(
         k,
         v,
         kv_cache,
         num_tokens=k.shape[0],
         query_start_loc=torch.tensor([0, k.shape[0]], dtype=torch.long),
-        req_ids=[req_id],
         num_computed_tokens_cpu=torch.tensor([g0], dtype=torch.long),
         slot_mapping=slots,
         quantize_kv=_quantize_kv_pair,
@@ -224,9 +221,8 @@ def _write_iter_decode(
     kv_cache: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
     *,
     g0: int,
-    req_id: str = "req-0",
 ) -> None:
-    writer._tail_windows.clear()
+    writer.prune_tail_windows(0)
     for i in range(k.shape[0]):
         writer.write_batch(
             k[i : i + 1],
@@ -234,7 +230,6 @@ def _write_iter_decode(
             kv_cache,
             num_tokens=1,
             query_start_loc=torch.tensor([0, 1], dtype=torch.long),
-            req_ids=[req_id],
             num_computed_tokens_cpu=torch.tensor([g0 + i], dtype=torch.long),
             slot_mapping=slots[i : i + 1],
             quantize_kv=_quantize_kv_pair,
@@ -248,10 +243,11 @@ class TestC8MxfpTailWindowKVWrite(unittest.TestCase):
     HEAD_DIM = 128
     BLOCK_SIZE = 512
     NUM_BLOCKS = 4
-    REQ_ID = "req-0"
+    MAX_NUM_SEQS = 8
+    REQ_IDX = 0
 
     def _fresh_writer(self) -> MxfpTailWindowWriter:
-        return MxfpTailWindowWriter()
+        return MxfpTailWindowWriter(max_num_seqs=self.MAX_NUM_SEQS)
 
     def test_split_segments_full_and_tail(self):
         pos = torch.tensor([128, 129, 130, 192, 193], dtype=torch.long)
@@ -329,7 +325,13 @@ class TestC8MxfpTailWindowKVWrite(unittest.TestCase):
         torch.testing.assert_close(snap_ref.v_fp8, snap_iter.v_fp8)
         torch.testing.assert_close(snap_ref.k_scale, snap_iter.k_scale)
         torch.testing.assert_close(snap_ref.v_scale_cache, snap_iter.v_scale_cache)
-        self.assertNotIn(self.REQ_ID, writer_iter._tail_windows)
+        writer_iter.ensure_buffers(
+            num_kv_heads=self.NUM_KV_HEADS,
+            head_dim=self.HEAD_DIM,
+            dtype=k.dtype,
+            device=k.device,
+        )
+        self.assertEqual(int(writer_iter.win_lens[self.REQ_IDX].item()), 0)
 
     def test_tail_window_64_iter_matches_one_shot_g0_128(self):
         w = 64
@@ -369,8 +371,13 @@ class TestC8MxfpTailWindowKVWrite(unittest.TestCase):
         torch.testing.assert_close(snap_ref.v_fp8, snap_iter.v_fp8)
         torch.testing.assert_close(snap_ref.k_scale, snap_iter.k_scale)
         torch.testing.assert_close(snap_ref.v_scale_cache, snap_iter.v_scale_cache)
-        self.assertIn(self.REQ_ID, writer_iter._tail_windows)
-        self.assertEqual(writer_iter._tail_windows[self.REQ_ID].w, 3)
+        writer_iter.ensure_buffers(
+            num_kv_heads=self.NUM_KV_HEADS,
+            head_dim=self.HEAD_DIM,
+            dtype=k.dtype,
+            device=k.device,
+        )
+        self.assertEqual(int(writer_iter.win_lens[self.REQ_IDX].item()), 3)
 
     def test_single_token_write_diverges_from_window(self):
         """Regression: writing only the last token must not match full-window quant."""
@@ -414,10 +421,16 @@ class TestC8MxfpTailWindowKVWrite(unittest.TestCase):
         k, v = _make_bf16_kv(2, self.NUM_KV_HEADS, self.HEAD_DIM, g0=g0, seed=1)
         slots = _make_slots(2, g0, self.BLOCK_SIZE)
         cache = _alloc_kv_cache(self.NUM_BLOCKS, self.BLOCK_SIZE, self.NUM_KV_HEADS, self.HEAD_DIM)
-        _write_iter_decode(writer, k, v, slots, cache, g0=g0, req_id="stale-req")
-        self.assertIn("stale-req", writer._tail_windows)
-        writer.prune_tail_windows({"other-req"})
-        self.assertNotIn("stale-req", writer._tail_windows)
+        _write_iter_decode(writer, k, v, slots, cache, g0=g0)
+        writer.ensure_buffers(
+            num_kv_heads=self.NUM_KV_HEADS,
+            head_dim=self.HEAD_DIM,
+            dtype=k.dtype,
+            device=k.device,
+        )
+        self.assertGreater(int(writer.win_lens[0].item()), 0)
+        writer.prune_tail_windows(0)
+        self.assertEqual(int(writer.win_lens[0].item()), 0)
 
     def test_tail_windows_isolated_per_request(self):
         writer = self._fresh_writer()
@@ -436,18 +449,23 @@ class TestC8MxfpTailWindowKVWrite(unittest.TestCase):
             cache,
             num_tokens=4,
             query_start_loc=torch.tensor([0, 2, 4], dtype=torch.long),
-            req_ids=["req-a", "req-b"],
             num_computed_tokens_cpu=torch.tensor([128, 256], dtype=torch.long),
             slot_mapping=torch.cat([slots_a, slots_b]),
             quantize_kv=_quantize_kv_pair,
             write_mxfp8=_cpu_write_mxfp8,
             block_size=self.BLOCK_SIZE,
         )
-        self.assertIn("req-a", writer._tail_windows)
-        self.assertIn("req-b", writer._tail_windows)
+        writer.ensure_buffers(
+            num_kv_heads=self.NUM_KV_HEADS,
+            head_dim=self.HEAD_DIM,
+            dtype=k_a.dtype,
+            device=k_a.device,
+        )
+        self.assertGreater(int(writer.win_lens[0].item()), 0)
+        self.assertGreater(int(writer.win_lens[1].item()), 0)
 
         cache_a_ref = _alloc_kv_cache(self.NUM_BLOCKS, self.BLOCK_SIZE, self.NUM_KV_HEADS, self.HEAD_DIM)
-        _write_once(self._fresh_writer(), k_a, v_a, slots_a, cache_a_ref, g0=128, req_id="req-a")
+        _write_once(self._fresh_writer(), k_a, v_a, slots_a, cache_a_ref, g0=128)
         snap_a = _read_cache_snapshot(cache, slots_a)
         snap_a_ref = _read_cache_snapshot(cache_a_ref, slots_a)
         torch.testing.assert_close(snap_a.k_fp8, snap_a_ref.k_fp8)

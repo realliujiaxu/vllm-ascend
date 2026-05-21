@@ -147,7 +147,7 @@ class TestMxfpKvPageSizeBytes(unittest.TestCase):
 
 
 class TestMxfpVScaleCacheScatter(unittest.TestCase):
-    def test_v_scale_slot_matches_qwen3_moe_formula(self):
+    def test_v_scale_rows_map_to_cache_slots(self):
         block_size = 128
         num_kv_heads = 2
         head_dim = 64
@@ -163,7 +163,6 @@ class TestMxfpVScaleCacheScatter(unittest.TestCase):
         )
         num_tokens = 100
         slots = torch.arange(num_tokens, dtype=torch.long)
-        v_scale_slots_ref = (slots // MXFP_KV_SCALE_GROUP_SIZE).unique()
 
         num_scale_groups = (num_tokens + MXFP_KV_SCALE_GROUP_SIZE - 1) // MXFP_KV_SCALE_GROUP_SIZE
         value_scale = torch.arange(
@@ -178,20 +177,12 @@ class TestMxfpVScaleCacheScatter(unittest.TestCase):
             block_size,
         )
 
-        block_ids = v_scale_slots_ref // groups_per_block
-        cache_group_ids = v_scale_slots_ref % groups_per_block
-        write_group_ids = torch.arange(num_tokens) // MXFP_KV_SCALE_GROUP_SIZE
-        slot_groups = slots // MXFP_KV_SCALE_GROUP_SIZE
-        sort_idx = torch.argsort(slot_groups, stable=True)
-        sorted_groups = slot_groups[sort_idx]
-        sorted_write_groups = write_group_ids[sort_idx]
-        unique_mask = torch.cat(
-            (torch.tensor([True]), sorted_groups[1:] != sorted_groups[:-1])
-        )
-        unique_write_groups = sorted_write_groups[unique_mask]
-        expected_by_slot = value_scale[unique_write_groups]
+        group_start_indices = torch.arange(num_scale_groups) * MXFP_KV_SCALE_GROUP_SIZE
+        global_v_scale_groups = slots[group_start_indices] // MXFP_KV_SCALE_GROUP_SIZE
+        block_ids = global_v_scale_groups // groups_per_block
+        v_scale_slot_mapping = global_v_scale_groups % groups_per_block
 
         torch.testing.assert_close(
-            value_scale_cache[block_ids, :, cache_group_ids, :, :],
-            expected_by_slot,
+            value_scale_cache[block_ids, :, v_scale_slot_mapping, :, :],
+            value_scale,
         )

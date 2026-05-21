@@ -257,17 +257,18 @@ def scatter_mxfp_v_scale_cache(
     slot_mapping: torch.Tensor,
     block_size: int,
 ) -> None:
-    """Scatter per-batch V scales into the paged V-scale cache.
-
-    Matches ``modeling_qwen3_moe.py`` MXFP prefill slot derivation::
-
-        v_scale_slot = (kv_slot_mapping // (QUANT_BLOCK_SIZE * 2)).unique()
-
-    with ``QUANT_BLOCK_SIZE=32`` (i.e. group size 64 along the token axis).
+    """Scatter per-group V scales into the paged V-scale cache.
 
     ``value_scale`` comes from ``npu_dynamic_mx_quant(..., axis=0)`` and has shape
     ``[ceil(num_tokens, 64), num_kv_heads, head_dim, 2]``. The cache layout is
     ``[num_blocks, num_kv_heads, block_size // 64, head_dim, 2]``.
+
+    Each row of ``value_scale`` corresponds to one 64-token V-scale group in
+    the current write. The token-level slot mapping is converted to a
+    scale-level mapping by taking each group's first token slot, then mapping
+    that global group into ``(block_id, v_scale_slot_mapping)``.
+    Callers must split writes on V-scale group boundaries before calling this
+    helper.
     """
     validate_mxfp_v_scale_block_size(block_size)
     slots = slot_mapping.to(torch.long)
@@ -283,25 +284,13 @@ def scatter_mxfp_v_scale_cache(
         )
 
     groups_per_block = mxfp_kv_block_scale_groups(block_size)
-    write_group_ids = torch.arange(num_tokens, device=slots.device, dtype=torch.long)
-    write_group_ids = write_group_ids // MXFP_KV_SCALE_GROUP_SIZE
-    slot_groups = slots // MXFP_KV_SCALE_GROUP_SIZE
+    group_start_indices = torch.arange(num_scale_groups, device=slots.device, dtype=torch.long)
+    group_start_indices = group_start_indices * MXFP_KV_SCALE_GROUP_SIZE
+    global_v_scale_groups = slots[group_start_indices] // MXFP_KV_SCALE_GROUP_SIZE
 
-    sort_idx = torch.argsort(slot_groups, stable=True)
-    sorted_groups = slot_groups[sort_idx]
-    sorted_write_groups = write_group_ids[sort_idx]
-    unique_mask = torch.cat(
-        (
-            torch.tensor([True], device=slots.device),
-            sorted_groups[1:] != sorted_groups[:-1],
-        )
-    )
-    unique_slot_groups = sorted_groups[unique_mask]
-    unique_write_groups = sorted_write_groups[unique_mask]
-
-    block_ids = unique_slot_groups // groups_per_block
-    cache_group_ids = unique_slot_groups % groups_per_block
-    value_scale_cache[block_ids, :, cache_group_ids, :, :] = value_scale[unique_write_groups]
+    block_ids = global_v_scale_groups // groups_per_block
+    v_scale_slot_mapping = global_v_scale_groups % groups_per_block
+    value_scale_cache[block_ids, :, v_scale_slot_mapping, :, :] = value_scale
 
 
 # Backward-compatible aliases.

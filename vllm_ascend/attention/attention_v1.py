@@ -1179,54 +1179,6 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
     paged cache, and FIA consumes them from the transposed cache layout.
     """
 
-    def _quantize_kv_to_mxfp8(
-        self,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        attn_metadata: AscendMetadata,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        encoder_decoder = self.attn_type == AttentionType.ENCODER_DECODER
-        if encoder_decoder:
-            actual_key, actual_value = key, value
-        else:
-            num_actual_tokens = attn_metadata.num_actual_tokens
-            actual_key = key[:num_actual_tokens]
-            actual_value = value[:num_actual_tokens]
-        if (
-            actual_key.shape[-1] % MXFP_KV_SCALE_GROUP_SIZE != 0
-            or actual_value.shape[-1] % MXFP_KV_SCALE_GROUP_SIZE != 0
-        ):
-            raise ValueError(
-                f"C8_MXFP KV cache requires K/V head dims divisible by {MXFP_KV_SCALE_GROUP_SIZE}, "
-                f"got {actual_key.shape[-1]}/{actual_value.shape[-1]}."
-            )
-
-        k_shape = actual_key.shape
-        v_shape = actual_value.shape
-        quant_key, key_scale = torch_npu.npu_dynamic_mx_quant(
-            actual_key,
-            dst_type=torch.float8_e4m3fn,
-        )
-        quant_value, value_scale = torch_npu.npu_dynamic_mx_quant(
-            actual_value,
-            dst_type=torch.float8_e4m3fn,
-            axis=0,
-        )
-        quant_key = quant_key.view(k_shape)
-        quant_value = quant_value.view(v_shape)
-        return quant_key, quant_value, key_scale, value_scale
-
-    def _quantize_query_to_mxfp8(
-        self,
-        query: torch.Tensor,
-        attn_metadata: AscendMetadata,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        num_tokens = attn_metadata.actual_seq_lengths_q[-1]
-        return torch_npu.npu_dynamic_mx_quant(
-            query[:num_tokens],
-            dst_type=torch.float8_e4m3fn,
-        )
-
     def _transpose_kv_cache(
         self, kv_cache: tuple[torch.Tensor]
     ) -> tuple[torch.Tensor]:
@@ -1533,17 +1485,27 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         if self.enable_hamming_sparse:
             raise NotImplementedError("C8_MXFP attention does not support hamming sparse KV compression yet.")
 
-        quant_query, query_scale = self._quantize_query_to_mxfp8(query, attn_metadata)
-        quant_key, quant_value, key_scale, value_scale = self._quantize_kv_to_mxfp8(
-            key, value, attn_metadata
+        query_mxfp8, query_scale = torch_npu.npu_dynamic_mx_quant(
+            query[:attn_metadata.num_actual_tokens],
+            dst_type=torch.float8_e4m3fn,
         )
+        key_mxfp8, key_scale = torch_npu.npu_dynamic_mx_quant(
+            key[:attn_metadata.num_actual_tokens],
+            dst_type=torch.float8_e4m3fn,
+        )
+        value_mxfp8, value_scale = torch_npu.npu_dynamic_mx_quant(
+            value[:attn_metadata.num_actual_tokens],
+            dst_type=torch.float8_e4m3fn,
+            axis=0
+        )
+
         self.reshape_and_cache(
-            quant_key, quant_value, key_scale, value_scale, kv_cache, attn_metadata
+            key_mxfp8, value_mxfp8, key_scale, value_scale, kv_cache, attn_metadata
         )
 
         fia_kv_cache = self._transpose_kv_cache(kv_cache)
         return self._forward_mxfp8_attention(
-            quant_query, query_scale, fia_kv_cache, attn_metadata, output
+            query_mxfp8, query_scale, fia_kv_cache, attn_metadata, output
         )
 
 

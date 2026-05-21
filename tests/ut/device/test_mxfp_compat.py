@@ -15,6 +15,7 @@ from vllm_ascend.device.mxfp_compat import (
     mxfp_v_scale_page_bytes,
     mxfp_resolve_kv_cache_layout,
     mxfp_v_scale_numel,
+    scatter_mxfp_k_scale_cache,
     scatter_mxfp_v_scale_cache,
 )
 
@@ -146,24 +147,61 @@ class TestMxfpKvPageSizeBytes(unittest.TestCase):
             )
 
 
-class TestMxfpVScaleCacheScatter(unittest.TestCase):
-    def test_v_scale_slot_matches_qwen3_moe_formula(self):
+class TestMxfpKScaleCacheScatter(unittest.TestCase):
+    def test_k_scale_scatter_by_block_coords(self):
         block_size = 128
         num_kv_heads = 2
         head_dim = 64
         num_blocks = 4
-        groups_per_block = block_size // MXFP_KV_SCALE_GROUP_SIZE
+        groups_per_head = head_dim // MXFP_KV_SCALE_GROUP_SIZE
+
+        key_scale_cache = torch.zeros(
+            num_blocks,
+            num_kv_heads,
+            block_size,
+            groups_per_head,
+            2,
+        )
+        num_tokens = 10
+        slots = torch.tensor([0, 1, 64, 65, 128, 200, 201, 202, 300, 301], dtype=torch.long)
+        key_scale = torch.arange(
+            num_tokens * num_kv_heads * groups_per_head * 2,
+            dtype=torch.float32,
+        ).view(num_tokens, num_kv_heads, groups_per_head, 2)
+
+        scatter_mxfp_k_scale_cache(
+            key_scale,
+            key_scale_cache,
+            slots,
+            block_size,
+        )
+
+        block_ids = slots // block_size
+        block_offsets = slots % block_size
+        torch.testing.assert_close(
+            key_scale_cache[block_ids, :, block_offsets, :, :],
+            key_scale,
+        )
+
+
+class TestMxfpVScaleCacheScatter(unittest.TestCase):
+    def test_v_scale_slot_matches_design_doc(self):
+        block_size = 128
+        num_kv_heads = 2
+        head_dim = 64
+        num_blocks = 4
+        v_scale_cache_block_size = block_size // MXFP_KV_SCALE_GROUP_SIZE
 
         value_scale_cache = torch.zeros(
             num_blocks,
             num_kv_heads,
-            groups_per_block,
+            v_scale_cache_block_size,
             head_dim,
             2,
         )
         num_tokens = 100
         slots = torch.arange(num_tokens, dtype=torch.long)
-        v_scale_slots_ref = (slots // MXFP_KV_SCALE_GROUP_SIZE).unique()
+        v_scale_slot_mapping = (slots // MXFP_KV_SCALE_GROUP_SIZE).unique()
 
         num_scale_groups = (num_tokens + MXFP_KV_SCALE_GROUP_SIZE - 1) // MXFP_KV_SCALE_GROUP_SIZE
         value_scale = torch.arange(
@@ -178,20 +216,38 @@ class TestMxfpVScaleCacheScatter(unittest.TestCase):
             block_size,
         )
 
-        block_ids = v_scale_slots_ref // groups_per_block
-        cache_group_ids = v_scale_slots_ref % groups_per_block
-        write_group_ids = torch.arange(num_tokens) // MXFP_KV_SCALE_GROUP_SIZE
-        slot_groups = slots // MXFP_KV_SCALE_GROUP_SIZE
-        sort_idx = torch.argsort(slot_groups, stable=True)
-        sorted_groups = slot_groups[sort_idx]
-        sorted_write_groups = write_group_ids[sort_idx]
-        unique_mask = torch.cat(
-            (torch.tensor([True]), sorted_groups[1:] != sorted_groups[:-1])
+        block_ids = v_scale_slot_mapping // v_scale_cache_block_size
+        v_scale_cache_offsets = v_scale_slot_mapping % v_scale_cache_block_size
+        torch.testing.assert_close(
+            value_scale_cache[block_ids, :, v_scale_cache_offsets, :, :],
+            value_scale,
         )
-        unique_write_groups = sorted_write_groups[unique_mask]
-        expected_by_slot = value_scale[unique_write_groups]
+
+    def test_v_scale_tail_group_example(self):
+        block_size = 512
+        num_kv_heads = 8
+        head_dim = 128
+        num_blocks = 2
+        v_scale_cache_block_size = block_size // MXFP_KV_SCALE_GROUP_SIZE
+
+        value_scale_cache = torch.zeros(
+            num_blocks,
+            num_kv_heads,
+            v_scale_cache_block_size,
+            head_dim,
+            2,
+        )
+        slots = torch.tensor([128, 129, 130], dtype=torch.long)
+        value_scale = torch.full((1, num_kv_heads, head_dim, 2), 3.0)
+
+        scatter_mxfp_v_scale_cache(
+            value_scale,
+            value_scale_cache,
+            slots,
+            block_size,
+        )
 
         torch.testing.assert_close(
-            value_scale_cache[block_ids, :, cache_group_ids, :, :],
-            expected_by_slot,
+            value_scale_cache[0, :, 2, :, :],
+            value_scale[0],
         )

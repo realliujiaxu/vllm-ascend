@@ -64,6 +64,7 @@ from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.device.mxfp_compat import (
     FLOAT8_E8M0FNU_DTYPE,
     MXFP_KV_SCALE_GROUP_SIZE,
+    scatter_mxfp_k_scale_cache,
     scatter_mxfp_v_scale_cache,
 )
 from vllm_ascend.ops.flashcomm2_oshard_manager import flashcomm2_oshard_manager
@@ -1427,17 +1428,16 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         slot_mapping: torch.Tensor,
         block_size: int,
     ) -> None:
-        slots = slot_mapping.to(torch.long)
-        # key_scale: [num_tokens, num_kv_heads, head_dim // 64, 2]
-        # key_scale_cache: [num_blocks, num_kv_heads, block_size, head_dim // 64, 2]
-        key_scale_cache.permute(0, 2, 1, 3, 4).reshape(
-            -1, key_scale_cache.shape[1], key_scale_cache.shape[3], key_scale_cache.shape[4]
-        )[slots] = key_scale
-
+        scatter_mxfp_k_scale_cache(
+            key_scale,
+            key_scale_cache,
+            slot_mapping,
+            block_size,
+        )
         scatter_mxfp_v_scale_cache(
             value_scale,
             value_scale_cache,
-            slots,
+            slot_mapping,
             block_size,
         )
 

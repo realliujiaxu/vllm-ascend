@@ -1458,20 +1458,23 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         )
 
     def _ensure_tail_writer(self, value: torch.Tensor) -> MxfpTailWindowWriter:
-        if self._mxfp_tail_writer is None:
+        writer = getattr(self, "_mxfp_tail_writer", None)
+        if writer is None:
             max_num_seqs = self.vllm_config.scheduler_config.max_num_seqs
-            self._mxfp_tail_writer = MxfpTailWindowWriter.create(
+            writer = MxfpTailWindowWriter.create(
                 max_num_seqs,
                 self.num_kv_heads,
                 value.shape[-1],
                 value.device,
                 value.dtype,
             )
-        return self._mxfp_tail_writer
+            self._mxfp_tail_writer = writer
+        return writer
 
     def prune_tail_windows(self, num_reqs: int) -> None:
-        if self._mxfp_tail_writer is not None:
-            self._mxfp_tail_writer.prune(num_reqs)
+        writer = getattr(self, "_mxfp_tail_writer", None)
+        if writer is not None:
+            writer.prune(num_reqs)
 
     @staticmethod
     def _req_token_range(req_idx: int, actual_seq_lengths_q: list[int]) -> tuple[int, int]:
@@ -1495,7 +1498,7 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         kv_cache: tuple[torch.Tensor],
     ) -> None:
         """Re-quantize the tail window and scatter V + V scale only."""
-        writer = self._mxfp_tail_writer
+        writer = getattr(self, "_mxfp_tail_writer", None)
         assert writer is not None
         win_v = writer.win_v[req_idx, :quant_len]
         win_slots = writer.win_slots[req_idx, :quant_len]

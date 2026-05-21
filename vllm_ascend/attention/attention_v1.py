@@ -1534,9 +1534,9 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         slots = slot_mapping.to(torch.long)
         # key_scale: [num_tokens, num_kv_heads, head_dim // 64, 2]
         # key_scale_cache: [num_blocks, num_kv_heads, block_size, head_dim // 64, 2]
-        key_scale_cache.permute(0, 2, 1, 3, 4).reshape(
-            -1, key_scale_cache.shape[1], key_scale_cache.shape[3], key_scale_cache.shape[4]
-        )[slots] = key_scale
+        block_ids = slots // block_size
+        block_offsets = slots % block_size
+        key_scale_cache[block_ids, :, block_offsets, :, :] = key_scale
 
         scatter_mxfp_v_scale_cache(
             value_scale,

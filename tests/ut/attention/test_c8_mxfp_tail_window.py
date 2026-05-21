@@ -109,17 +109,15 @@ def _cpu_write_mxfp8(
     slots = slot_mapping[:num_actual_tokens].to(torch.long)
     key_cache.reshape(-1, *key_cache.shape[2:])[slots] = quant_key[:num_actual_tokens]
     value_cache.reshape(-1, *value_cache.shape[2:])[slots] = quant_value[:num_actual_tokens]
-    key_scale_cache.permute(0, 2, 1, 3, 4).reshape(
-        -1,
-        key_scale_cache.shape[1],
-        key_scale_cache.shape[3],
-        key_scale_cache.shape[4],
-    )[slots] = key_scale[:num_actual_tokens]
+    block_size = key_cache.shape[1]
+    block_ids = slots // block_size
+    block_offsets = slots % block_size
+    key_scale_cache[block_ids, :, block_offsets, :, :] = key_scale[:num_actual_tokens]
     scatter_mxfp_v_scale_cache(
         value_scale,
         value_scale_cache,
         slots,
-        key_cache.shape[1],
+        block_size,
     )
 
 
@@ -131,12 +129,10 @@ def _read_cache_snapshot(
     slots_l = slots.to(torch.long)
     k_fp8 = key_cache.reshape(-1, *key_cache.shape[2:])[slots_l].clone()
     v_fp8 = value_cache.reshape(-1, *value_cache.shape[2:])[slots_l].clone()
-    k_scale = key_scale_cache.permute(0, 2, 1, 3, 4).reshape(
-        -1,
-        key_scale_cache.shape[1],
-        key_scale_cache.shape[3],
-        key_scale_cache.shape[4],
-    )[slots_l].clone()
+    block_size = key_cache.shape[1]
+    block_ids = slots_l // block_size
+    block_offsets = slots_l % block_size
+    k_scale = key_scale_cache[block_ids, :, block_offsets, :, :].clone()
     return CacheSnapshot(
         k_fp8=k_fp8,
         v_fp8=v_fp8,
@@ -216,6 +212,51 @@ class TestC8MxfpTailWindowKVWrite(unittest.TestCase):
         pos_full = torch.arange(64, dtype=torch.long)
         segs_full = split_tokens_into_v_group_segments(pos_full)
         self.assertEqual(segs_full, [(0, 64, True)])
+
+    def test_key_scale_write_updates_multi_head_cache(self):
+        num_tokens = 3
+        k, v = _make_bf16_kv(num_tokens, self.NUM_KV_HEADS, self.HEAD_DIM, g0=0, seed=123)
+        slots = torch.tensor([0, self.BLOCK_SIZE + 1, self.BLOCK_SIZE * 2 + 2], dtype=torch.long)
+        cache = _alloc_kv_cache(self.NUM_BLOCKS, self.BLOCK_SIZE, self.NUM_KV_HEADS, self.HEAD_DIM)
+
+        qk, qv, key_scale, value_scale = _quantize_kv_pair(k, v)
+        _cpu_write_mxfp8(qk, qv, key_scale, value_scale, cache, slots, num_tokens)
+
+        # Golden is the key_scale produced by the CPU reference quantizer before
+        # the cache write; reading K scale back by slots must return the same values.
+        snapshot = _read_cache_snapshot(cache, slots)
+        torch.testing.assert_close(snapshot.k_scale, key_scale)
+
+    def test_value_and_v_scale_write_updates_cache(self):
+        w = MXFP_KV_SCALE_GROUP_SIZE * 2
+        k, v = _make_bf16_kv(w, self.NUM_KV_HEADS, self.HEAD_DIM, g0=0, seed=456)
+        slots = torch.cat(
+            (
+                torch.arange(0, MXFP_KV_SCALE_GROUP_SIZE, dtype=torch.long),
+                torch.arange(
+                    self.BLOCK_SIZE,
+                    self.BLOCK_SIZE + MXFP_KV_SCALE_GROUP_SIZE,
+                    dtype=torch.long,
+                ),
+            )
+        )
+        cache = _alloc_kv_cache(self.NUM_BLOCKS, self.BLOCK_SIZE, self.NUM_KV_HEADS, self.HEAD_DIM)
+
+        qk, qv, key_scale, value_scale = _quantize_kv_pair(k, v)
+        _cpu_write_mxfp8(qk, qv, key_scale, value_scale, cache, slots, w)
+
+        snapshot = _read_cache_snapshot(cache, slots)
+        torch.testing.assert_close(snapshot.v_fp8, qv)
+
+        groups_per_block = self.BLOCK_SIZE // MXFP_KV_SCALE_GROUP_SIZE
+        slot_groups = slots[::MXFP_KV_SCALE_GROUP_SIZE] // MXFP_KV_SCALE_GROUP_SIZE
+        block_ids = slot_groups // groups_per_block
+        cache_group_ids = slot_groups % groups_per_block
+        _, _, _, value_scale_cache = cache
+        torch.testing.assert_close(
+            value_scale_cache[block_ids, :, cache_group_ids, :, :],
+            value_scale,
+        )
 
     def test_tail_window_64_iter_matches_one_shot(self):
         w = 64

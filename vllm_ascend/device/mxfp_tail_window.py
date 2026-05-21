@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""C8_MXFP tail-group KV cache write logic (CPU-testable, NPU-agnostic core)."""
+"""C8_MXFP tail-group KV cache write logic."""
 
 from __future__ import annotations
 
@@ -129,56 +129,6 @@ def iter_req_token_groups(
         local_len = end - start
         positions = torch.arange(local_len, dtype=torch.long) + base
         yield req_ids[req_idx], slice(start, end), positions
-
-
-def _encode_scale_as_uint8(scale: torch.Tensor) -> torch.Tensor:
-    """Pack float scales into uint8 for CPU cache mock (tests only)."""
-    return (scale.to(torch.float32) * 1000).round().clamp(0, 255).to(torch.uint8)
-
-
-def simplified_mx_dynamic_quant(
-    x: torch.Tensor,
-    *,
-    axis: int | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """CPU reference quant for unit tests (deterministic, group-wise).
-
-    Mimics ``npu_dynamic_mx_quant`` enough for tail-window equivalence tests:
-    - default / K path: per-token scale along head_dim groups
-    - ``axis=0``: one scale per up-to-64 rows (V tail groups)
-    """
-    if axis == 0:
-        w = x.shape[0]
-        num_groups = (w + MXFP_KV_SCALE_GROUP_SIZE - 1) // MXFP_KV_SCALE_GROUP_SIZE
-        tail_shape = x.shape[1:]
-        scale_rows = []
-        quant_chunks = []
-        for g in range(num_groups):
-            chunk = x[g * MXFP_KV_SCALE_GROUP_SIZE : min((g + 1) * MXFP_KV_SCALE_GROUP_SIZE, w)]
-            scale_val = chunk.abs().amax().clamp(min=1e-6)
-            scale_rows.append(scale_val)
-            quant_chunks.append(chunk / scale_val)
-        quant = torch.cat(quant_chunks, dim=0)
-        scale_stacked = torch.stack(scale_rows, dim=0)
-        value_scale = scale_stacked.view(num_groups, *([1] * len(tail_shape))).expand(
-            num_groups, *tail_shape
-        )
-        value_scale = value_scale.unsqueeze(-1).expand(*value_scale.shape, 2).contiguous()
-        return quant, _encode_scale_as_uint8(value_scale)
-
-    if x.dim() == 2:
-        x = x.unsqueeze(0)
-    if x.dim() != 3:
-        raise ValueError(f"simplified_mx_dynamic_quant expects rank-3 K tensor, got shape {x.shape}")
-    w, num_kv_heads, head_dim = x.shape
-    groups = head_dim // MXFP_KV_SCALE_GROUP_SIZE
-    grouped = x.view(w, num_kv_heads, groups, MXFP_KV_SCALE_GROUP_SIZE)
-    scale_per_group = grouped.abs().amax(dim=-1, keepdim=True).clamp(min=1e-6)
-    quant = (grouped / scale_per_group).view(w, num_kv_heads, head_dim)
-    key_scale = (
-        scale_per_group.squeeze(-1).unsqueeze(-1).expand(w, num_kv_heads, groups, 2).contiguous()
-    )
-    return quant, _encode_scale_as_uint8(key_scale)
 
 
 @dataclass

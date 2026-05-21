@@ -63,10 +63,11 @@ from vllm_ascend.compilation.acl_graph import (
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.device.mxfp_compat import (
     FLOAT8_E8M0FNU_DTYPE,
-    MXFP_KV_SCALE_GROUP_SIZE,
     scatter_mxfp_k_scale_cache,
+    scatter_mxfp_v_cache,
     scatter_mxfp_v_scale_cache,
 )
+from vllm_ascend.device.mxfp_tail_window import MxfpTailWindowWriter
 from vllm_ascend.ops.flashcomm2_oshard_manager import flashcomm2_oshard_manager
 from vllm_ascend.utils import weak_ref_tensors
 from vllm_ascend.worker.kvcomp_utils import KVCompMetaData
@@ -1177,7 +1178,41 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
     In forward(), Q and K/V are quantized to FP8 E4M3 (with E8M0 scales) before
     cache write; reshape_and_cache only scatters quantized K/V and scales into
     paged cache, and FIA consumes them from the transposed cache layout.
+
+    V axis=0 quantization uses a per-request tail window so partial 64-token
+    groups are re-quantized on decode append before the full cache write.
     """
+
+    def __init__(
+        self,
+        num_heads: int,
+        head_size: int,
+        scale: float,
+        num_kv_heads: int,
+        alibi_slopes: list[float] | None,
+        sliding_window: int | None,
+        kv_cache_dtype: str,
+        logits_soft_cap: float | None,
+        attn_type: str,
+        kv_sharing_target_layer_name: str | None,
+        sinks: torch.Tensor = None,
+        **kwargs,
+    ) -> None:
+        super().__init__(
+            num_heads,
+            head_size,
+            scale,
+            num_kv_heads,
+            alibi_slopes,
+            sliding_window,
+            kv_cache_dtype,
+            logits_soft_cap,
+            attn_type,
+            kv_sharing_target_layer_name,
+            sinks,
+            **kwargs,
+        )
+        self._mxfp_tail_writer: MxfpTailWindowWriter | None = None
 
     def _transpose_kv_cache(
         self, kv_cache: tuple[torch.Tensor]
@@ -1422,6 +1457,118 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
             block_size=key_cache.shape[1],
         )
 
+    def _ensure_tail_writer(self, value: torch.Tensor) -> MxfpTailWindowWriter:
+        if self._mxfp_tail_writer is None:
+            max_num_seqs = self.vllm_config.scheduler_config.max_num_seqs
+            self._mxfp_tail_writer = MxfpTailWindowWriter.create(
+                max_num_seqs,
+                self.num_kv_heads,
+                value.shape[-1],
+                value.device,
+                value.dtype,
+            )
+        return self._mxfp_tail_writer
+
+    def prune_tail_windows(self, num_reqs: int) -> None:
+        if self._mxfp_tail_writer is not None:
+            self._mxfp_tail_writer.prune(num_reqs)
+
+    @staticmethod
+    def _req_token_range(req_idx: int, actual_seq_lengths_q: list[int]) -> tuple[int, int]:
+        start = 0 if req_idx == 0 else actual_seq_lengths_q[req_idx - 1]
+        end = actual_seq_lengths_q[req_idx]
+        return start, end
+
+    @staticmethod
+    def _cat_token_tensors(parts: list[torch.Tensor]) -> torch.Tensor:
+        if len(parts) == 1:
+            return parts[0]
+        return torch.cat(parts, dim=0)
+
+    def _mxfp_quant_value(self, value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return torch_npu.npu_dynamic_mx_quant(value, dst_type=torch.float8_e4m3fn, axis=0)
+
+    def _rewrite_v_window_to_cache(
+        self,
+        req_idx: int,
+        quant_len: int,
+        kv_cache: tuple[torch.Tensor],
+    ) -> None:
+        """Re-quantize the tail window and scatter V + V scale only."""
+        writer = self._mxfp_tail_writer
+        assert writer is not None
+        win_v = writer.win_v[req_idx, :quant_len]
+        win_slots = writer.win_slots[req_idx, :quant_len]
+        value_mxfp8, value_scale = self._mxfp_quant_value(win_v)
+        _, value_cache, _, value_scale_cache = kv_cache
+        block_size = value_cache.shape[1]
+        scatter_mxfp_v_cache(value_mxfp8, value_cache, win_slots, block_size)
+        scatter_mxfp_v_scale_cache(
+            value_scale,
+            value_scale_cache,
+            win_slots,
+            block_size,
+        )
+
+    def _quantize_value_mxfp8_with_tail_window(
+        self,
+        value: torch.Tensor,
+        kv_cache: tuple[torch.Tensor],
+        attn_metadata: AscendMetadata,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Quantize V with tail-window handling; K is quantized separately in forward()."""
+        num_actual = attn_metadata.num_actual_tokens
+        value = value[:num_actual]
+        slots = attn_metadata.slot_mapping[:num_actual]
+
+        writer = self._ensure_tail_writer(value)
+        actual_seq_lengths_q = attn_metadata.actual_seq_lengths_q
+        num_decodes = attn_metadata.num_decodes
+        num_reqs = len(actual_seq_lengths_q)
+        attn_state = attn_metadata.attn_state
+
+        decode_v: list[torch.Tensor] = []
+        decode_vs: list[torch.Tensor] = []
+        prefill_v: list[torch.Tensor] = []
+        prefill_vs: list[torch.Tensor] = []
+
+        # ChunkedPrefill: process prefill requests first, then decode requests.
+        if attn_state != AscendAttentionState.DecodeOnly:
+            for req_idx in range(num_decodes, num_reqs):
+                start, end = self._req_token_range(req_idx, actual_seq_lengths_q)
+                req_value = value[start:end]
+                req_slots = slots[start:end]
+                num_tokens = end - start
+
+                value_mxfp8, value_scale = self._mxfp_quant_value(req_value)
+                writer.save_prefill_tail(req_idx, req_value, req_slots, num_tokens)
+
+                prefill_v.append(value_mxfp8)
+                prefill_vs.append(value_scale)
+
+        if attn_state in (AscendAttentionState.DecodeOnly, AscendAttentionState.ChunkedPrefill):
+            for req_idx in range(num_decodes):
+                start, end = self._req_token_range(req_idx, actual_seq_lengths_q)
+                req_value = value[start:end]
+                req_slots = slots[start:end]
+
+                for tok_i in range(req_value.shape[0]):
+                    quant_len = writer.refresh_decode_append(
+                        req_idx,
+                        req_value[tok_i],
+                        req_slots[tok_i],
+                    )
+                    self._rewrite_v_window_to_cache(req_idx, quant_len, kv_cache)
+
+                value_mxfp8, value_scale = self._mxfp_quant_value(req_value)
+                decode_v.append(value_mxfp8)
+                decode_vs.append(value_scale)
+
+        # Concatenate in batch token order: decode segment, then prefill segment.
+        value_mxfp8 = self._cat_token_tensors(decode_v + prefill_v)
+        value_scale = self._cat_token_tensors(decode_vs + prefill_vs)
+        return value_mxfp8, value_scale
+
     # KV cache writes for C8_MXFP happen in reshape_and_cache(), invoked from forward()
     # when key/value are present. This hook is only reached when attention is split from
     # cache update, e.g. Attention.forward with forward_includes_kv_cache_update=False
@@ -1493,10 +1640,8 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
             key[:attn_metadata.num_actual_tokens],
             dst_type=torch.float8_e4m3fn,
         )
-        value_mxfp8, value_scale = torch_npu.npu_dynamic_mx_quant(
-            value[:attn_metadata.num_actual_tokens],
-            dst_type=torch.float8_e4m3fn,
-            axis=0
+        value_mxfp8, value_scale = self._quantize_value_mxfp8_with_tail_window(
+            value, kv_cache, attn_metadata
         )
 
         self.reshape_and_cache(
@@ -1507,6 +1652,14 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         return self._forward_mxfp8_attention(
             query_mxfp8, query_scale, fia_kv_cache, attn_metadata, output
         )
+
+
+def prune_c8_mxfp_tail_windows(static_forward_context: dict, num_reqs: int) -> None:
+    """Clear inactive tail-window rows for all C8_MXFP attention layers."""
+    for layer in static_forward_context.values():
+        impl = getattr(layer, "impl", None)
+        if isinstance(impl, AscendC8MXFPAttentionBackendImpl):
+            impl.prune_tail_windows(num_reqs)
 
 
 class AscendC8AttentionBackendImpl(AscendAttentionBackendImpl):

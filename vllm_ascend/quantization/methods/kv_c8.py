@@ -173,6 +173,7 @@ class AscendC8MXFPKVCacheAttentionMethod(AscendAttentionScheme):
             from vllm_ascend.attention.attention_v1 import AscendC8MXFPAttentionBackendImpl
 
             layer.impl.__class__ = AscendC8MXFPAttentionBackendImpl
+            layer.impl._mxfp_tail_writer = None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         pass

@@ -1,14 +1,113 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 import vllm.model_executor.layers.attention.mla_attention
+import vllm.v1.core.kv_cache_utils as kv_cache_utils
 import vllm.v1.kv_cache_interface
 from typing_extensions import Self
+from vllm.config import VllmConfig, get_current_vllm_config
+from vllm.model_executor.layers.attention import Attention
 from vllm.utils.torch_utils import get_dtype_size
-from vllm.v1.kv_cache_interface import MLAAttentionSpec
+from vllm.v1.kv_cache_interface import AttentionSpec, FullAttentionSpec, MLAAttentionSpec
+
+from vllm_ascend.device.mxfp_compat import MXFP_KV_SCALE_GROUP_SIZE, mxfp_kv_page_size_bytes
+
+
+_orig_full_attention_spec_real_page_size_bytes = FullAttentionSpec.real_page_size_bytes.fget
+_orig_attention_get_kv_cache_spec = Attention.get_kv_cache_spec
+_orig_get_kv_cache_config_from_groups = kv_cache_utils.get_kv_cache_config_from_groups
+
+# Fallback when KV specs are built before quant_description is loaded from disk.
+_c8_mxfp_kv_cache_enabled = False
+
+
+def _is_c8_mxfp_quant_config(vllm_config: VllmConfig | None) -> bool:
+    if vllm_config is None:
+        return False
+    quant_config = getattr(vllm_config, "quant_config", None)
+    quant_description = getattr(quant_config, "quant_description", {})
+    return quant_description.get("kv_cache_type") == "C8_MXFP"
+
+
+def enable_c8_mxfp_kv_page_size() -> None:
+    global _c8_mxfp_kv_cache_enabled
+    _c8_mxfp_kv_cache_enabled = True
+
+
+def _get_vllm_config_for_c8_mxfp() -> VllmConfig | None:
+    try:
+        return get_current_vllm_config()
+    except Exception:
+        return None
+
+
+def _uses_c8_mxfp_kv_cache(spec: AttentionSpec, vllm_config: VllmConfig | None = None) -> bool:
+    if not isinstance(spec, FullAttentionSpec):
+        return False
+    cfg = vllm_config if vllm_config is not None else _get_vllm_config_for_c8_mxfp()
+    if _is_c8_mxfp_quant_config(cfg):
+        return True
+    return _c8_mxfp_kv_cache_enabled
+
+
+def _mxfp_page_size_for_spec(spec: FullAttentionSpec) -> int:
+    if spec.block_size % MXFP_KV_SCALE_GROUP_SIZE != 0:
+        raise ValueError(
+            f"C8_MXFP KV cache requires cache block_size divisible by {MXFP_KV_SCALE_GROUP_SIZE}, "
+            f"got {spec.block_size}."
+        )
+    k_dim = spec.head_size
+    v_dim = getattr(spec, "head_size_v", None) or spec.head_size
+    kv_dtype_size = get_dtype_size(spec.dtype)
+    if kv_dtype_size != 1:
+        kv_dtype_size = get_dtype_size(torch.float8_e4m3fn)
+    return mxfp_kv_page_size_bytes(
+        spec.block_size,
+        spec.num_kv_heads,
+        k_dim,
+        v_dim,
+        kv_dtype_size,
+    )
+
+
+def _ascend_attention_spec_real_page_size_bytes(self: AttentionSpec) -> int:
+    if not _uses_c8_mxfp_kv_cache(self):
+        return _orig_full_attention_spec_real_page_size_bytes(self)
+    return _mxfp_page_size_for_spec(self)
+
+
+FullAttentionSpec.real_page_size_bytes = property(_ascend_attention_spec_real_page_size_bytes)
+
+
+def _ascend_attention_get_kv_cache_spec(self, vllm_config: VllmConfig):
+    spec = _orig_attention_get_kv_cache_spec(self, vllm_config)
+    if spec is None or not isinstance(spec, FullAttentionSpec):
+        return spec
+    if not _is_c8_mxfp_quant_config(vllm_config):
+        return spec
+    enable_c8_mxfp_kv_page_size()
+    return replace(spec, dtype=torch.float8_e4m3fn)
+
+
+Attention.get_kv_cache_spec = _ascend_attention_get_kv_cache_spec
+
+
+def _ascend_get_kv_cache_config_from_groups(
+    vllm_config: VllmConfig,
+    kv_cache_groups: list,
+    available_memory: int,
+):
+    # KV cache specs may be collected before ModelSlim json is loaded; enable here
+    # so page_size_bytes uses mxfp layout when num_blocks/tensor sizes are computed.
+    if _is_c8_mxfp_quant_config(vllm_config):
+        enable_c8_mxfp_kv_page_size()
+    return _orig_get_kv_cache_config_from_groups(vllm_config, kv_cache_groups, available_memory)
+
+
+kv_cache_utils.get_kv_cache_config_from_groups = _ascend_get_kv_cache_config_from_groups
 
 
 @dataclass(frozen=True)

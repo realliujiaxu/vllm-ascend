@@ -40,6 +40,13 @@ from vllm.v1.worker.utils import AttentionGroup
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata, AscendPrefillContextParallelMetadata
+from vllm_ascend.device.mxfp_compat import (
+    mxfp_k_scale_numel,
+    validate_mxfp_v_scale_block_size,
+    mxfp_kv_page_size_bytes,
+    mxfp_resolve_kv_cache_layout,
+    mxfp_v_scale_numel,
+)
 from vllm_ascend.quantization.utils import enable_fa_quant
 from vllm_ascend.utils import calc_split_factor
 
@@ -215,6 +222,70 @@ def _align_memory(tensor: torch.Tensor, alignment: int) -> torch.Tensor:
     return tensor[int(offset) :]
 
 
+def _is_c8_mxfp_quant_enabled(vllm_config: VllmConfig) -> bool:
+    quant_config = getattr(vllm_config, "quant_config", None)
+    quant_description = getattr(quant_config, "quant_description", {})
+    return quant_description.get("kv_cache_type") == "C8_MXFP"
+
+
+def _is_c8_mxfp_kv_cache(
+    vllm_config: VllmConfig,
+    kv_cache_spec: AttentionSpec,
+    raw_cache_tensors: tuple[torch.Tensor, ...] | list[torch.Tensor] | None = None,
+) -> bool:
+    from vllm.v1.kv_cache_interface import FullAttentionSpec
+
+    if isinstance(kv_cache_spec, MLAAttentionSpec):
+        return False
+    if raw_cache_tensors is not None and len(raw_cache_tensors) >= 4:
+        return True
+    if not _is_c8_mxfp_quant_enabled(vllm_config):
+        return False
+    return isinstance(kv_cache_spec, FullAttentionSpec)
+
+
+def _reshape_c8_mxfp_kv_cache(
+    vllm_config: VllmConfig,
+    layer_name: str,
+    raw_cache_tensors: tuple[torch.Tensor, ...] | list[torch.Tensor],
+    kv_cache_spec: AttentionSpec,
+    is_kv_consumer: bool,
+    num_blocks_hint: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    raw_k_tensor, raw_v_tensor, raw_k_scale_tensor, raw_v_scale_tensor = raw_cache_tensors
+    k_dim, v_dim = _get_attention_kv_cache_dims(layer_name, kv_cache_spec)
+    k_shape, v_shape, k_scale_shape, v_scale_shape = mxfp_resolve_kv_cache_layout(
+        raw_k_numel=raw_k_tensor.numel(),
+        raw_v_numel=raw_v_tensor.numel(),
+        raw_k_scale_numel=raw_k_scale_tensor.numel(),
+        raw_v_scale_numel=raw_v_scale_tensor.numel(),
+        block_size=kv_cache_spec.block_size,
+        num_kv_heads=kv_cache_spec.num_kv_heads,
+        k_dim=k_dim,
+        v_dim=v_dim,
+        layer_name=layer_name,
+        num_blocks_hint=num_blocks_hint,
+    )
+    k_cache = raw_k_tensor.view(k_shape)
+    v_cache = raw_v_tensor.view(v_shape)
+    k_scale_cache = raw_k_scale_tensor.view(k_scale_shape)
+    v_scale_cache = raw_v_scale_tensor.view(v_scale_shape)
+    return k_cache, v_cache, k_scale_cache, v_scale_cache
+
+
+def _allocate_raw_cache_tensor(
+    size: int,
+    device: torch.device,
+    alignment: int,
+    needs_alignment: bool,
+    dtype: torch.dtype = torch.int8,
+) -> torch.Tensor:
+    if not needs_alignment:
+        return torch.zeros(size, dtype=dtype, device=device)
+    tensor = torch.zeros(size + alignment, dtype=dtype, device=device)
+    return _align_memory(tensor, alignment)[:size]
+
+
 def _allocate_kv_cache(
     kv_cache_config: KVCacheConfig,
     device: torch.device,
@@ -259,26 +330,69 @@ def _allocate_kv_cache(
 
         k_dim, v_dim = _get_attention_kv_cache_dims(example_layer_name, example_kv_cache_spec)
         assert k_dim > 0 and v_dim > 0
-        kv_head_dim_list = [k_dim, v_dim]
-        if is_kv_consumer and enable_fa_quant(vllm_config):
-            k_tensor_split_factor, v_tensor_split_factor = vllm_config.quant_config.get_kv_quant_split_factor(
-                example_layer_name, kv_head_dim_list
+        if _is_c8_mxfp_kv_cache(vllm_config, example_kv_cache_spec):
+            page_size_bytes = example_kv_cache_spec.page_size_bytes
+            kv_dtype_size = torch.float8_e4m3fn.itemsize
+            expected_page_size_bytes = mxfp_kv_page_size_bytes(
+                example_kv_cache_spec.block_size,
+                example_kv_cache_spec.num_kv_heads,
+                k_dim,
+                v_dim,
+                kv_dtype_size,
+            )
+            assert page_size_bytes == expected_page_size_bytes, (
+                f"C8_MXFP page_size mismatch: computed={page_size_bytes}, "
+                f"spec.page_size_bytes={example_kv_cache_spec.page_size_bytes}, "
+                f"layer={example_layer_name}, block_size={example_kv_cache_spec.block_size}, "
+                f"num_kv_heads={example_kv_cache_spec.num_kv_heads}, k_dim={k_dim}, v_dim={v_dim}"
+            )
+            assert kv_cache_tensor.size % page_size_bytes == 0, (
+                f"C8_MXFP kv_cache_tensor.size not divisible by page_size_bytes: "
+                f"kv_cache_tensor.size={kv_cache_tensor.size}, page_size_bytes={page_size_bytes}, "
+                f"remainder={kv_cache_tensor.size % page_size_bytes}, "
+                f"spec.page_size_bytes={example_kv_cache_spec.page_size_bytes}, "
+                f"layer={example_layer_name}, block_size={example_kv_cache_spec.block_size}, "
+                f"num_kv_heads={example_kv_cache_spec.num_kv_heads}, k_dim={k_dim}, v_dim={v_dim}"
+            )
+            num_blocks = kv_cache_tensor.size // page_size_bytes
+            num_heads = example_kv_cache_spec.num_kv_heads
+            block_size = example_kv_cache_spec.block_size
+            validate_mxfp_v_scale_block_size(block_size)
+            k_tensor_size = num_blocks * block_size * num_heads * k_dim
+            v_tensor_size = num_blocks * block_size * num_heads * v_dim
+            k_scale_tensor_size = mxfp_k_scale_numel(num_blocks, block_size, num_heads, k_dim)
+            v_scale_tensor_size = mxfp_v_scale_numel(num_blocks, block_size, num_heads, v_dim)
+            mxfp_kv_dtype = torch.float8_e4m3fn
+            k_tensor = _allocate_raw_cache_tensor(
+                k_tensor_size, device, alignment, needs_alignment=False, dtype=mxfp_kv_dtype
+            )
+            v_tensor = _allocate_raw_cache_tensor(
+                v_tensor_size, device, alignment, needs_alignment=False, dtype=mxfp_kv_dtype
+            )
+            k_scale_tensor = _allocate_raw_cache_tensor(
+                k_scale_tensor_size, device, alignment, needs_alignment=False, dtype=torch.uint8
+            )
+            v_scale_tensor = _allocate_raw_cache_tensor(
+                v_scale_tensor_size, device, alignment, needs_alignment=False, dtype=torch.uint8
             )
         else:
-            k_tensor_split_factor, v_tensor_split_factor = calc_split_factor(kv_head_dim_list)
-        k_tensor_size = int(kv_cache_tensor.size // k_tensor_split_factor)
-        v_tensor_size = int(kv_cache_tensor.size // v_tensor_split_factor)
-
-        if vllm_config.kv_transfer_config is None:
-            k_tensor = torch.zeros(k_tensor_size, dtype=torch.int8, device=device)
-            v_tensor = torch.zeros(v_tensor_size, dtype=torch.int8, device=device)
-        else:
-            k_tensor = torch.zeros(k_tensor_size + alignment, dtype=torch.int8, device=device)
-            v_tensor = torch.zeros(v_tensor_size + alignment, dtype=torch.int8, device=device)
-            k_tensor = _align_memory(k_tensor, alignment)[:k_tensor_size]
-            v_tensor = _align_memory(v_tensor, alignment)[:v_tensor_size]
+            kv_head_dim_list = [k_dim, v_dim]
+            if is_kv_consumer and enable_fa_quant(vllm_config):
+                k_tensor_split_factor, v_tensor_split_factor = vllm_config.quant_config.get_kv_quant_split_factor(
+                    example_layer_name, kv_head_dim_list
+                )
+            else:
+                k_tensor_split_factor, v_tensor_split_factor = calc_split_factor(kv_head_dim_list)
+            k_tensor_size = int(kv_cache_tensor.size // k_tensor_split_factor)
+            v_tensor_size = int(kv_cache_tensor.size // v_tensor_split_factor)
+            needs_alignment = vllm_config.kv_transfer_config is not None
+            k_tensor = _allocate_raw_cache_tensor(k_tensor_size, device, alignment, needs_alignment)
+            v_tensor = _allocate_raw_cache_tensor(v_tensor_size, device, alignment, needs_alignment)
         for layer_name in kv_cache_tensor.shared_by:
-            kv_cache_raw_tensors[layer_name] = (k_tensor, v_tensor)
+            if _is_c8_mxfp_kv_cache(vllm_config, example_kv_cache_spec):
+                kv_cache_raw_tensors[layer_name] = (k_tensor, v_tensor, k_scale_tensor, v_scale_tensor)
+            else:
+                kv_cache_raw_tensors[layer_name] = (k_tensor, v_tensor)
 
     layer_names = set()
     for group in kv_cache_config.kv_cache_groups:
@@ -320,10 +434,21 @@ def _reshape_kv_cache(
             assert isinstance(kv_cache_spec, AttentionSpec)
 
             if isinstance(kv_cache_spec, AttentionSpec):
-                raw_k_tensor, raw_v_tensor = kv_cache_raw_tensors[layer_name]
+                raw_cache_tensors = kv_cache_raw_tensors[layer_name]
+                raw_k_tensor, raw_v_tensor = raw_cache_tensors[:2]
                 assert raw_k_tensor is not None
                 assert raw_v_tensor is not None
-                sum_page_size_bytes = raw_k_tensor.numel() + raw_v_tensor.numel()
+                if _is_c8_mxfp_kv_cache(vllm_config, kv_cache_spec, raw_cache_tensors):
+                    kv_caches[layer_name] = _reshape_c8_mxfp_kv_cache(
+                        vllm_config,
+                        layer_name,
+                        raw_cache_tensors,
+                        kv_cache_spec,
+                        is_kv_consumer,
+                        num_blocks_hint=kv_cache_config.num_blocks,
+                    )
+                    continue
+                sum_page_size_bytes = sum(tensor.numel() for tensor in raw_cache_tensors)
                 assert sum_page_size_bytes % kv_cache_spec.page_size_bytes == 0
                 num_blocks = sum_page_size_bytes // kv_cache_spec.page_size_bytes
 

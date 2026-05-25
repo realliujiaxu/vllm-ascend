@@ -61,3 +61,204 @@ def ensure_mxfp4_moe_available(feature: str) -> None:
         feature,
         ("float4_e2m1fn_x2", "float8_e8m0fnu", "npu_dynamic_mx_quant", "npu_grouped_matmul_swiglu_quant_v2"),
     )
+
+
+# KV cache MXFP8 scale layouts:
+# K token:  [num_tokens, num_kv_heads, head_dim // 64, 2]
+# K cache:  [num_blocks, num_kv_heads, block_size, head_dim // 64, 2]
+# V token scale (axis=0 quant): [cdiv(num_tokens, 64), num_kv_heads, head_dim, 2]
+# V cache:  [num_blocks, num_kv_heads, block_size // 64, head_dim, 2]
+MXFP_KV_SCALE_GROUP_SIZE = 64
+MXFP_KV_SCALE_VALUES_PER_GROUP = 2
+# Unified per-block scale bytes: num_kv_heads * block_size * head_dim / MXFP8_GROUP_SIZE (K and V).
+MXFP8_GROUP_SIZE = 32
+# E8M0 scale elements are always 1 byte in KV cache budgeting.
+MXFP_SCALE_DTYPE_SIZE = 1
+
+
+def validate_mxfp_k_scale_head_dim(head_dim: int) -> None:
+    if head_dim % MXFP_KV_SCALE_GROUP_SIZE != 0:
+        raise ValueError(
+            f"C8_MXFP K scale cache requires head_dim divisible by {MXFP_KV_SCALE_GROUP_SIZE}, got {head_dim}."
+        )
+
+
+def validate_mxfp_v_scale_block_size(block_size: int) -> None:
+    if block_size % MXFP_KV_SCALE_GROUP_SIZE != 0:
+        raise ValueError(
+            f"C8_MXFP V scale cache requires block_size divisible by {MXFP_KV_SCALE_GROUP_SIZE}, got {block_size}."
+        )
+
+
+def mxfp_kv_scale_groups(head_dim: int) -> int:
+    validate_mxfp_k_scale_head_dim(head_dim)
+    return head_dim // MXFP_KV_SCALE_GROUP_SIZE
+
+
+def mxfp_kv_block_scale_groups(block_size: int) -> int:
+    validate_mxfp_v_scale_block_size(block_size)
+    return block_size // MXFP_KV_SCALE_GROUP_SIZE
+
+
+def mxfp_k_scale_page_bytes(num_kv_heads: int, block_size: int, head_dim: int) -> int:
+    """Bytes per block for k_scale cache."""
+    validate_mxfp_k_scale_head_dim(head_dim)
+    return num_kv_heads * block_size * head_dim // MXFP8_GROUP_SIZE
+
+
+def mxfp_v_scale_page_bytes(num_kv_heads: int, block_size: int, head_dim: int) -> int:
+    """Bytes per block for v_scale cache."""
+    validate_mxfp_v_scale_block_size(block_size)
+    return num_kv_heads * block_size * head_dim // MXFP8_GROUP_SIZE
+
+
+def mxfp_k_scale_cache_shape(
+    num_blocks: int,
+    block_size: int,
+    num_kv_heads: int,
+    head_dim: int,
+) -> tuple[int, int, int, int, int]:
+    return (
+        num_blocks,
+        num_kv_heads,
+        block_size,
+        mxfp_kv_scale_groups(head_dim),
+        MXFP_KV_SCALE_VALUES_PER_GROUP,
+    )
+
+
+def mxfp_v_scale_cache_shape(
+    num_blocks: int,
+    block_size: int,
+    num_kv_heads: int,
+    head_dim: int,
+) -> tuple[int, int, int, int, int]:
+    return (
+        num_blocks,
+        num_kv_heads,
+        mxfp_kv_block_scale_groups(block_size),
+        head_dim,
+        MXFP_KV_SCALE_VALUES_PER_GROUP,
+    )
+
+
+def mxfp_k_scale_numel(num_blocks: int, block_size: int, num_kv_heads: int, head_dim: int) -> int:
+    return num_blocks * mxfp_k_scale_page_bytes(num_kv_heads, block_size, head_dim)
+
+
+def mxfp_v_scale_numel(num_blocks: int, block_size: int, num_kv_heads: int, head_dim: int) -> int:
+    return num_blocks * mxfp_v_scale_page_bytes(num_kv_heads, block_size, head_dim)
+
+
+def mxfp_kv_page_size_bytes(
+    block_size: int,
+    num_kv_heads: int,
+    k_dim: int,
+    v_dim: int,
+    kv_dtype_size: int,
+) -> int:
+    """Bytes per KV cache page for C8_MXFP (FP8 K/V tensors + E8M0 scale caches)."""
+    kv_bytes = block_size * num_kv_heads * (k_dim + v_dim) * kv_dtype_size
+    scale_bytes = (
+        mxfp_k_scale_page_bytes(num_kv_heads, block_size, k_dim)
+        + mxfp_v_scale_page_bytes(num_kv_heads, block_size, v_dim)
+    ) * MXFP_SCALE_DTYPE_SIZE
+    return kv_bytes + scale_bytes
+
+
+def mxfp_get_scale_dtype() -> torch.dtype:
+    """Dtype used for MXFP E8M0 scale cache tensors (always 1 byte per element)."""
+    if FLOAT8_E8M0FNU_DTYPE is not None:
+        return FLOAT8_E8M0FNU_DTYPE
+    return torch.uint8
+
+
+def mxfp_get_kv_cache_layout(
+    *,
+    num_blocks: int,
+    block_size: int,
+    num_kv_heads: int,
+    k_dim: int,
+    v_dim: int,
+) -> tuple[
+    tuple[int, int, int, int],
+    tuple[int, int, int, int],
+    tuple[int, int, int, int, int],
+    tuple[int, int, int, int, int],
+]:
+    """Return C8_MXFP KV cache shapes from spec dims."""
+    k_shape = (num_blocks, block_size, num_kv_heads, k_dim)
+    v_shape = (num_blocks, block_size, num_kv_heads, v_dim)
+    k_scale_shape = (
+        num_blocks,
+        num_kv_heads,
+        block_size,
+        k_dim // MXFP_KV_SCALE_GROUP_SIZE,
+        MXFP_KV_SCALE_VALUES_PER_GROUP,
+    )
+    v_scale_shape = (
+        num_blocks,
+        num_kv_heads,
+        block_size // MXFP_KV_SCALE_GROUP_SIZE,
+        v_dim,
+        MXFP_KV_SCALE_VALUES_PER_GROUP,
+    )
+    return k_shape, v_shape, k_scale_shape, v_scale_shape
+
+
+def scatter_mxfp_v_scale_cache(
+    value_scale: torch.Tensor,
+    value_scale_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    block_size: int,
+) -> None:
+    """Scatter per-batch V scales into the paged V-scale cache.
+
+    Matches ``modeling_qwen3_moe.py`` MXFP prefill slot derivation::
+
+        v_scale_slot = (kv_slot_mapping // (QUANT_BLOCK_SIZE * 2)).unique()
+
+    with ``QUANT_BLOCK_SIZE=32`` (i.e. group size 64 along the token axis).
+
+    ``value_scale`` comes from ``npu_dynamic_mx_quant(..., axis=0)`` and has shape
+    ``[ceil(num_tokens, 64), num_kv_heads, head_dim, 2]``. The cache layout is
+    ``[num_blocks, num_kv_heads, block_size // 64, head_dim, 2]``.
+    """
+    validate_mxfp_v_scale_block_size(block_size)
+    slots = slot_mapping.to(torch.long)
+    num_tokens = slots.numel()
+    if num_tokens == 0:
+        return
+
+    num_scale_groups = (num_tokens + MXFP_KV_SCALE_GROUP_SIZE - 1) // MXFP_KV_SCALE_GROUP_SIZE
+    if value_scale.shape[0] != num_scale_groups:
+        raise ValueError(
+            f"C8_MXFP value_scale batch dim mismatch: got {value_scale.shape[0]}, "
+            f"expected {num_scale_groups} for num_tokens={num_tokens}."
+        )
+
+    groups_per_block = mxfp_kv_block_scale_groups(block_size)
+    write_group_ids = torch.arange(num_tokens, device=slots.device, dtype=torch.long)
+    write_group_ids = write_group_ids // MXFP_KV_SCALE_GROUP_SIZE
+    slot_groups = slots // MXFP_KV_SCALE_GROUP_SIZE
+
+    sort_idx = torch.argsort(slot_groups, stable=True)
+    sorted_groups = slot_groups[sort_idx]
+    sorted_write_groups = write_group_ids[sort_idx]
+    unique_mask = torch.cat(
+        (
+            torch.tensor([True], device=slots.device),
+            sorted_groups[1:] != sorted_groups[:-1],
+        )
+    )
+    unique_slot_groups = sorted_groups[unique_mask]
+    unique_write_groups = sorted_write_groups[unique_mask]
+
+    block_ids = unique_slot_groups // groups_per_block
+    cache_group_ids = unique_slot_groups % groups_per_block
+    value_scale_cache[block_ids, :, cache_group_ids, :, :] = value_scale[unique_write_groups]
+
+
+# Backward-compatible aliases.
+mxfp_kv_scale_cache_shape = mxfp_k_scale_cache_shape
+mxfp_kv_scale_numel = mxfp_k_scale_numel

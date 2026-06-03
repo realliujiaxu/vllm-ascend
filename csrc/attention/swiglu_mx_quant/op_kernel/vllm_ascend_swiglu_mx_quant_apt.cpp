@@ -9,7 +9,7 @@
  */
 
 /*!
- * \file swiglu_mx_quant.cpp
+ * \file vllm_ascend_swiglu_mx_quant_apt.cpp
  * \brief Kernel entry point for SwiGLU + MX quantization operator
  */
 
@@ -24,8 +24,8 @@
 #define SWIGLU_MX_QUANT_LAST_LAST_GROUP_INDEX_INT64    1200
 
 using namespace AscendC;
-extern "C" __global__ __aicore__ void swiglu_mx_quant(GM_ADDR x, GM_ADDR group_index,GM_ADDR y, GM_ADDR mxscale,
-                                                         GM_ADDR workspace, GM_ADDR tiling)
+extern "C" __global__ __aicore__ void vllm_ascend_swiglu_mx_quant(GM_ADDR x, GM_ADDR group_index, GM_ADDR y,
+                                                                   GM_ADDR mxscale, GM_ADDR workspace, GM_ADDR tiling)
 {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
     REGISTER_TILING_DEFAULT(SwigluMxQuantTilingData);

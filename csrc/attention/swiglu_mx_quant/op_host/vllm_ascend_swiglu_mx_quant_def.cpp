@@ -148,7 +148,7 @@ public:
         regbaseCfg.DynamicCompileStaticFlag(true)
                 .DynamicRankSupportFlag(true)
                 .DynamicShapeSupportFlag(true)
-                .ExtendCfgInfo("opFile.value", "swiglu_mx_quant_apt");
+                .ExtendCfgInfo("opFile.value", "vllm_ascend_swiglu_mx_quant_apt");
         this->AICore().AddConfig("ascend950", regbaseCfg);
     }
 };

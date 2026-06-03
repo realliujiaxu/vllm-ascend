@@ -20,8 +20,8 @@
 
 using namespace std;
 
-extern "C" __global__ __aicore__ void swiglu_mx_quant(GM_ADDR x, GM_ADDR group_index, GM_ADDR y, GM_ADDR mxscale,
-                                                          GM_ADDR workspace, GM_ADDR tiling);
+extern "C" __global__ __aicore__ void vllm_ascend_swiglu_mx_quant(GM_ADDR x, GM_ADDR group_index, GM_ADDR y,
+    GM_ADDR mxscale, GM_ADDR workspace, GM_ADDR tiling);
 
 class SwigluMxQuantKernelTest : public testing::Test {
 protected:
@@ -84,7 +84,7 @@ static void RunKernelTest(size_t batchSize, size_t seqLen, size_t hiddenDim, int
 
     uint32_t blockDim = static_cast<uint32_t>(tilingData->usedCoreNum);
     ICPU_SET_TILING_KEY(tilingKey);
-    ICPU_RUN_KF(swiglu_mx_quant, blockDim, x, group_index, y, mxscale, workspace, tiling);
+    ICPU_RUN_KF(vllm_ascend_swiglu_mx_quant, blockDim, x, group_index, y, mxscale, workspace, tiling);
 
     AscendC::GmFree(x);
     AscendC::GmFree(y);

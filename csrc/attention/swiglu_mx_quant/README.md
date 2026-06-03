@@ -1,4 +1,4 @@
-# SwigluMxQuant
+# VllmAscendSwigluMxQuant
 
 ## 产品支持情况
 
@@ -184,4 +184,4 @@
 
 | 调用方式 | 调用样例 | 说明 |
 | :------- | :------- | :--- |
-| aclnn调用 | [test_aclnn_swiglu_mx_quant](./examples/test_swiglu_mx_quant.cpp) | 通过[aclnnSwigluMxQuant](./docs/aclnnSwigluMxQuant.md)接口方式调用SwigluMxQuant算子。 |
+| aclnn调用 | [test_aclnn_swiglu_mx_quant](./examples/test_swiglu_mx_quant.cpp) | 通过[aclnnVllmAscendSwigluMxQuant](./docs/aclnnVllmAscendSwigluMxQuant.md)接口方式调用VllmAscendSwigluMxQuant算子。 |

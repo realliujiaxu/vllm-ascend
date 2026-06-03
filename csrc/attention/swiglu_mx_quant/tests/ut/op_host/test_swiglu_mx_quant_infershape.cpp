@@ -36,7 +36,7 @@ protected:
 
 TEST_F(SwigluMxQuantTest, SwigluMxQuant_infershape_case_0_fp16)
 {
-    ge::op::SwigluMxQuant op;
+    ge::op::VllmAscendSwigluMxQuant op;
     ge::TensorDesc xDesc;
     ge::Shape xShape({8, 128, 8192});
     xDesc.SetDataType(ge::DT_FLOAT16);
@@ -55,7 +55,7 @@ TEST_F(SwigluMxQuantTest, SwigluMxQuant_infershape_case_0_fp16)
 
 TEST_F(SwigluMxQuantTest, SwigluMxQuant_infershape_case_1_bf16)
 {
-    ge::op::SwigluMxQuant op;
+    ge::op::VllmAscendSwigluMxQuant op;
     ge::TensorDesc xDesc;
     ge::Shape xShape({4, 64, 2048});
     xDesc.SetDataType(ge::DT_BF16);
@@ -73,7 +73,7 @@ TEST_F(SwigluMxQuantTest, SwigluMxQuant_infershape_case_1_bf16)
 
 TEST_F(SwigluMxQuantTest, SwigluMxQuant_infershape_case_dynamic_shape)
 {
-    ge::op::SwigluMxQuant op;
+    ge::op::VllmAscendSwigluMxQuant op;
     ge::TensorDesc xDesc;
     ge::Shape xShape({-2});
     xDesc.SetDataType(ge::DT_FLOAT16);
@@ -94,7 +94,7 @@ TEST_F(SwigluMxQuantTest, SwigluMxQuant_infershape_case_dynamic_shape)
 
 TEST_F(SwigluMxQuantTest, SwigluMxQuant_infershape_error_invalid_dim)
 {
-    ge::op::SwigluMxQuant op;
+    ge::op::VllmAscendSwigluMxQuant op;
     ge::TensorDesc xDesc;
     ge::Shape xShape({4, 64, 1023});
     xDesc.SetDataType(ge::DT_FLOAT16);
@@ -108,7 +108,7 @@ TEST_F(SwigluMxQuantTest, SwigluMxQuant_infershape_error_invalid_dim)
 
 TEST_F(SwigluMxQuantTest, SwigluMxQuant_infershape_error_invalid_axis)
 {
-    ge::op::SwigluMxQuant op;
+    ge::op::VllmAscendSwigluMxQuant op;
     ge::TensorDesc xDesc;
     ge::Shape xShape({4, 64, 2048});
     xDesc.SetDataType(ge::DT_FLOAT16);

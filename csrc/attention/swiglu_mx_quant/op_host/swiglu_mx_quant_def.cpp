@@ -17,9 +17,9 @@
 
 namespace ops {
 
-class SwigluMxQuant : public OpDef {
+class VllmAscendSwigluMxQuant : public OpDef {
 public:
-    explicit SwigluMxQuant(const char* name) : OpDef(name)
+    explicit VllmAscendSwigluMxQuant(const char* name) : OpDef(name)
     {
         // 算子支持以下 dtype 和 format 组合（16种）：
         // 输入 x: FLOAT16, BFLOAT16
@@ -153,6 +153,6 @@ public:
     }
 };
 
-OP_ADD(SwigluMxQuant);
+OP_ADD(VllmAscendSwigluMxQuant);
 
 } // namespace ops

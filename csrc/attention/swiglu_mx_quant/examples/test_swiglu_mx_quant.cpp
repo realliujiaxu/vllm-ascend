@@ -1,7 +1,7 @@
 #include <iostream>
 #include <vector>
 #include "acl/acl.h"
-#include "aclnnop/aclnn_swiglu_mx_quant.h"
+#include "aclnnop/aclnn_vllm_ascend_swiglu_mx_quant.h"
 
 #define CHECK_RET(cond, return_expr) \
   do {                               \
@@ -114,18 +114,18 @@ int main() {
   // 3. 调用CANN算子库API，需要修改为具体的Api名称
   uint64_t workspaceSize = 0;
   aclOpExecutor* executor;
-  // 调用aclnnSwigluMxQuant第一段接口
-  ret = aclnnSwigluMxQuantGetWorkspaceSize(x, nullptr, activateDim, activateLeft, swigluMode, clampLimit, gluAlpha, gluBias,groupMode, axis, dstType, "rint", scaleAlg, maxDtypeValue, out, scaleOut, &workspaceSize, &executor);
-  CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclnnSwigluMxQuantGetWorkspaceSize failed. ERROR: %d\n", ret); return ret);
+  // 调用aclnnVllmAscendSwigluMxQuant第一段接口
+  ret = aclnnVllmAscendSwigluMxQuantGetWorkspaceSize(x, nullptr, activateDim, activateLeft, swigluMode, clampLimit, gluAlpha, gluBias,groupMode, axis, dstType, "rint", scaleAlg, maxDtypeValue, out, scaleOut, &workspaceSize, &executor);
+  CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclnnVllmAscendSwigluMxQuantGetWorkspaceSize failed. ERROR: %d\n", ret); return ret);
   // 根据第一段接口计算出的workspaceSize申请device内存
   void* workspaceAddr = nullptr;
   if (workspaceSize > 0) {
     ret = aclrtMalloc(&workspaceAddr, workspaceSize, ACL_MEM_MALLOC_HUGE_FIRST);
     CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("allocate workspace failed. ERROR: %d\n", ret); return ret);
   }
-  // 调用aclnnSwigluMxQuant第二段接口
-  ret = aclnnSwigluMxQuant(workspaceAddr, workspaceSize, executor, stream);
-  CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclnnSwigluMxQuant failed. ERROR: %d\n", ret); return ret);
+  // 调用aclnnVllmAscendSwigluMxQuant第二段接口
+  ret = aclnnVllmAscendSwigluMxQuant(workspaceAddr, workspaceSize, executor, stream);
+  CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclnnVllmAscendSwigluMxQuant failed. ERROR: %d\n", ret); return ret);
 
   // 4. （固定写法）同步等待任务执行结束
   ret = aclrtSynchronizeStream(stream);

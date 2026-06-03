@@ -1,4 +1,4 @@
-# aclnnSwigluMxQuant
+# aclnnVllmAscendSwigluMxQuant
 
 ## 产品支持情况
 
@@ -13,7 +13,7 @@
 
 ## 功能说明
 
-- 接口功能：在Swish门控线性单元激活函数后添加DynamicMxQuant操作，实现x的SwigluMxQuant计算。
+- 接口功能：在Swish门控线性单元激活函数后添加DynamicMxQuant操作，实现x的VllmAscendSwigluMxQuant计算。
 - swigluMode为0时的计算公式：  
 
   $$
@@ -95,10 +95,10 @@
 
 ## 函数原型
 
-每个算子分为[两段式接口](../../../docs/zh/context/两段式接口.md)，必须先调用“aclnnSwigluMxQuantGetWorkspaceSize”接口获取计算所需workspace大小以及包含了算子计算流程的执行器，再调用“aclnnSwigluMxQuant”接口执行计算。
+每个算子分为[两段式接口](../../../docs/zh/context/两段式接口.md)，必须先调用“aclnnVllmAscendSwigluMxQuantGetWorkspaceSize”接口获取计算所需workspace大小以及包含了算子计算流程的执行器，再调用“aclnnVllmAscendSwigluMxQuant”接口执行计算。
 
 ```Cpp
-aclnnStatus aclnnSwigluMxQuantGetWorkspaceSize(
+aclnnStatus aclnnVllmAscendSwigluMxQuantGetWorkspaceSize(
   const aclTensor *x,
   const aclTensor *groupIndexOptional,
   int64_t          activateDim,
@@ -120,14 +120,14 @@ aclnnStatus aclnnSwigluMxQuantGetWorkspaceSize(
 ```
 
 ```Cpp
-aclnnStatus aclnnSwigluMxQuant(
+aclnnStatus aclnnVllmAscendSwigluMxQuant(
   void          *workspace,
   uint64_t       workspaceSize,
   aclOpExecutor *executor,
   aclrtStream    stream)
 ```
 
-## aclnnSwigluMxQuantGetWorkspaceSize
+## aclnnVllmAscendSwigluMxQuantGetWorkspaceSize
 
 - **参数说明：**
 
@@ -393,7 +393,7 @@ aclnnStatus aclnnSwigluMxQuant(
     </tr>
   </tbody></table>
 
-## aclnnSwigluMxQuant
+## aclnnVllmAscendSwigluMxQuant
 
 - **参数说明：**
   <table style="undefined;table-layout: fixed; width: 953px"><colgroup>
@@ -416,7 +416,7 @@ aclnnStatus aclnnSwigluMxQuant(
     <tr>
       <td>workspaceSize</td>
       <td>输入</td>
-      <td>在Device侧申请的workspace大小，由第一段接口aclnnSwigluMxQuantGetWorkspaceSize获取。</td>
+      <td>在Device侧申请的workspace大小，由第一段接口aclnnVllmAscendSwigluMxQuantGetWorkspaceSize获取。</td>
     </tr>
     <tr>
       <td>executor</td>
@@ -438,7 +438,7 @@ aclnnStatus aclnnSwigluMxQuant(
 ## 约束说明
 
 - 确定性计算：
-  - aclnnSwigluMxQuant默认确定性实现。
+  - aclnnVllmAscendSwigluMxQuant默认确定性实现。
 
 - 输入x对应activateDim的维度需要是2的倍数，且x的维数必须大于1维。
 - 当输出yOut的数据类型为FLOAT4_E2M1、FLOAT4_E1M2时，yOut的最后一维需要是2的倍数，x的最后一维需要是4的倍数。
@@ -453,7 +453,7 @@ aclnnStatus aclnnSwigluMxQuant(
 #include <iostream>
 #include <vector>
 #include "acl/acl.h"
-#include "aclnnop/aclnn_swiglu_mx_quant.h"
+#include "aclnnop/aclnn_vllm_ascend_swiglu_mx_quant.h"
 
 #define CHECK_RET(cond, return_expr) \
   do {                               \
@@ -566,18 +566,18 @@ int main() {
   // 3. 调用CANN算子库API，需要修改为具体的Api名称
   uint64_t workspaceSize = 0;
   aclOpExecutor* executor;
-  // 调用aclnnSwigluMxQuant第一段接口
-  ret = aclnnSwigluMxQuantGetWorkspaceSize(x, nullptr, activateDim, activateLeft, swigluMode, clampLimit, gluAlpha, gluBias,groupMode, axis, dstType, "rint", scaleAlg, maxDtypeValue, out, scaleOut, &workspaceSize, &executor);
-  CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclnnSwigluMxQuantGetWorkspaceSize failed. ERROR: %d\n", ret); return ret);
+  // 调用aclnnVllmAscendSwigluMxQuant第一段接口
+  ret = aclnnVllmAscendSwigluMxQuantGetWorkspaceSize(x, nullptr, activateDim, activateLeft, swigluMode, clampLimit, gluAlpha, gluBias,groupMode, axis, dstType, "rint", scaleAlg, maxDtypeValue, out, scaleOut, &workspaceSize, &executor);
+  CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclnnVllmAscendSwigluMxQuantGetWorkspaceSize failed. ERROR: %d\n", ret); return ret);
   // 根据第一段接口计算出的workspaceSize申请device内存
   void* workspaceAddr = nullptr;
   if (workspaceSize > 0) {
     ret = aclrtMalloc(&workspaceAddr, workspaceSize, ACL_MEM_MALLOC_HUGE_FIRST);
     CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("allocate workspace failed. ERROR: %d\n", ret); return ret);
   }
-  // 调用aclnnSwigluMxQuant第二段接口
-  ret = aclnnSwigluMxQuant(workspaceAddr, workspaceSize, executor, stream);
-  CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclnnSwigluMxQuant failed. ERROR: %d\n", ret); return ret);
+  // 调用aclnnVllmAscendSwigluMxQuant第二段接口
+  ret = aclnnVllmAscendSwigluMxQuant(workspaceAddr, workspaceSize, executor, stream);
+  CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclnnVllmAscendSwigluMxQuant failed. ERROR: %d\n", ret); return ret);
 
   // 4. （固定写法）同步等待任务执行结束
   ret = aclrtSynchronizeStream(stream);

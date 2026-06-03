@@ -175,7 +175,7 @@ ge::graphStatus InferDataTypeForSwigluMxQuant(gert::InferDataTypeContext* contex
     return ge::GRAPH_SUCCESS;
 }
 
-IMPL_OP_INFERSHAPE(SwigluMxQuant)
+IMPL_OP_INFERSHAPE(VllmAscendSwigluMxQuant)
     .InferShape(InferShapeForSwigluMxQuant)
     .InferDataType(InferDataTypeForSwigluMxQuant);
 } // namespace ops

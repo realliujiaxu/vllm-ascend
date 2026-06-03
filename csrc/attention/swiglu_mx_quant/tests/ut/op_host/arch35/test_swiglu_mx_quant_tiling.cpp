@@ -67,7 +67,7 @@ static void ExecuteTestCase(
 
     optiling::SwigluMxQuantCompileInfo compile_info;
 
-    std::string op_type("SwigluMxQuant");
+    std::string op_type("VllmAscendSwigluMxQuant");
     ASSERT_NE(gert::OpImplRegistry::GetInstance().GetOpImpl(op_type.c_str()), nullptr);
     auto tiling_func = gert::OpImplRegistry::GetInstance().GetOpImpl(op_type.c_str())->tiling;
     auto tiling_parse_func = gert::OpImplRegistry::GetInstance().GetOpImpl(op_type.c_str())->tiling_parse;

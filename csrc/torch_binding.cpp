@@ -1892,7 +1892,7 @@ std::tuple<at::Tensor, at::Tensor> swiglu_mx_quant_npu(
     std::string round_mode_str = std::string(round_mode);
     char* round_mode_ptr = const_cast<char*>(round_mode_str.c_str());
 
-    EXEC_NPU_CMD(aclnnSwigluMxQuant, x, group_index_value, activate_dim, activate_left, swiglu_mode, clamp_limit,
+    EXEC_NPU_CMD(aclnnVllmAscendSwigluMxQuant, x, group_index_value, activate_dim, activate_left, swiglu_mode, clamp_limit,
                  glu_alpha, glu_bias, group_mode, axis, dst_type_code, round_mode_ptr, scale_alg, max_dtype_value, y,
                  mxscale);
 

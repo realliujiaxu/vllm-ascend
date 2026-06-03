@@ -650,7 +650,7 @@ ge::graphStatus Tiling4SwigluMxQuant(gert::TilingContext *context)
 }
 
 // ==================== 注册 Tiling 接口 ====================
-IMPL_OP_OPTILING(SwigluMxQuant)
+IMPL_OP_OPTILING(VllmAscendSwigluMxQuant)
     .Tiling(Tiling4SwigluMxQuant)
     .TilingParse<SwigluMxQuantCompileInfo>(TilingPrepare4SwigluMxQuant);
 } // namespace optiling

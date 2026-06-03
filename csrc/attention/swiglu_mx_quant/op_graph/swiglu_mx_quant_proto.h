@@ -75,7 +75,7 @@ namespace ge {
 * @par Third-party framework compatibility
 * It is a custom operator. It has no corresponding operator in Caffe, ONNX, TensorFlow, or PyTorch.
 */
-REG_OP(SwigluMxQuant)
+REG_OP(VllmAscendSwigluMxQuant)
     .INPUT(x, TensorType({DT_FLOAT16, DT_BF16}))
     .OPTIONAL_INPUT(group_index, TensorType({DT_INT32, DT_INT64}))
     .OUTPUT(y, TensorType({DT_FLOAT4_E2M1, DT_FLOAT4_E1M2, DT_FLOAT8_E4M3FN, DT_FLOAT8_E5M2}))
@@ -92,7 +92,7 @@ REG_OP(SwigluMxQuant)
     .ATTR(round_mode, String, "rint")
     .ATTR(scale_alg, Int, 0)
     .ATTR(max_dtype_value, Float, 0.0f)
-    .OP_END_FACTORY_REG(SwigluMxQuant)
+    .OP_END_FACTORY_REG(VllmAscendSwigluMxQuant)
 
 } // namespace ge
 

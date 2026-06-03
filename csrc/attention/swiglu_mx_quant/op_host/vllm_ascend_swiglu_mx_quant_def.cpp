@@ -9,7 +9,7 @@
  */
 
 /*!
- * \file swiglu_mx_quant_def.cpp
+ * \file vllm_ascend_swiglu_mx_quant_def.cpp
  * \brief SwiGLU activation combined with dynamic MX quantization operator definition
  */
 

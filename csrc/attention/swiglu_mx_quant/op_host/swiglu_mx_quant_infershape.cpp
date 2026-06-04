@@ -146,8 +146,10 @@ graphStatus InferShapeForSwigluMxQuant(gert::InferShapeContext* context)
 
     if (Ops::Base::IsUnknownRank(*xShape)) {
         OP_LOGD(context->GetNodeName(), "x shape is UnknownRank, set y, mxscale shape to (-2, )");
-        Ops::Base::SetUnknownRank(*yShape);
-        Ops::Base::SetUnknownRank(*mxscaleShape);
+        yShape->SetDimNum(1);
+        yShape->SetDim(0, UNKNOWN_RANK_DIM);
+        mxscaleShape->SetDimNum(1);
+        mxscaleShape->SetDim(0, UNKNOWN_RANK_DIM);
         return ge::GRAPH_SUCCESS;
     }
     return ComputeInferShape(context, xShape, yShape, mxscaleShape);

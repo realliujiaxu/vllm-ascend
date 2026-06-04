@@ -43,6 +43,11 @@ constexpr size_t MAX_DIM_NUM = 7;
 static const std::initializer_list<ge::DataType> Y_SUPPORT_DTYPE_SET = {
     ge::DT_FLOAT4_E2M1, ge::DT_FLOAT4_E1M2, ge::DT_FLOAT8_E4M3FN, ge::DT_FLOAT8_E5M2};
 
+bool IsUnknownRankShape(const gert::Shape& shape)
+{
+    return shape.GetDimNum() == 1 && shape.GetDim(0) == UNKNOWN_RANK_DIM;
+}
+
 graphStatus ComputeInferShape(gert::InferShapeContext* context, const gert::Shape* xShape, gert::Shape* yShape,
                               gert::Shape* mxscaleShape)
 {
@@ -144,7 +149,7 @@ graphStatus InferShapeForSwigluMxQuant(gert::InferShapeContext* context)
         OP_LOGE(context->GetNodeName(), "Input x rank[%lu] should be in [1, 7].", xShape->GetDimNum()),
         return ge::GRAPH_FAILED);
 
-    if (Ops::Base::IsUnknownRank(*xShape)) {
+    if (IsUnknownRankShape(*xShape)) {
         OP_LOGD(context->GetNodeName(), "x shape is UnknownRank, set y, mxscale shape to (-2, )");
         yShape->SetDimNum(1);
         yShape->SetDim(0, UNKNOWN_RANK_DIM);

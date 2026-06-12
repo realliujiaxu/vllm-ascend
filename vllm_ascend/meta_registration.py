@@ -88,7 +88,7 @@ def sgmv_expand_meta(
     return y_out
 
 
-if not is_310p():
-    register_meta_if_necessary("_C_ascend", "get_masked_input_and_mask", get_masked_input_and_mask_meta)
-    register_meta_if_necessary("_C_ascend", "bgmv_expand", bgmv_expand_meta)
-    register_meta_if_necessary("_C_ascend", "sgmv_expand", sgmv_expand_meta)
+# if not is_310p():
+#     register_meta_if_necessary("_C_ascend", "get_masked_input_and_mask", get_masked_input_and_mask_meta)
+#     register_meta_if_necessary("_C_ascend", "bgmv_expand", bgmv_expand_meta)
+#     register_meta_if_necessary("_C_ascend", "sgmv_expand", sgmv_expand_meta)

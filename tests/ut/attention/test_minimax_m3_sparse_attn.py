@@ -192,8 +192,8 @@ def test_prefill_index_topk_correctness(index_layout: str) -> None:
     local_blocks = 1
     num_idx_heads = 2
     head_dim = 16
-    q_lens = torch.tensor((4, 3), device=DEVICE, dtype=torch.int32)
-    prefix_lens = torch.tensor((0, 1024), device=DEVICE, dtype=torch.int32)
+    q_lens = torch.tensor((4, 3, 16*1024), device=DEVICE, dtype=torch.int32)
+    prefix_lens = torch.tensor((0, 1024, 112*1024), device=DEVICE, dtype=torch.int32)
     seq_lens = prefix_lens + q_lens
     batch = q_lens.numel()
     max_seq_len = int(seq_lens.max().item())
@@ -355,7 +355,7 @@ def test_decode_index_topk_correctness(
     local_blocks = 1
     num_idx_heads = 2
     head_dim = 16
-    active_seq_lens = torch.tensor((7, 129, 1025), device=DEVICE, dtype=torch.int32)
+    active_seq_lens = torch.tensor((7, 129, 1025, 128*1024), device=DEVICE, dtype=torch.int32)
     q_lens = torch.full_like(active_seq_lens, decode_query_len)
     prefix_lens = active_seq_lens - decode_query_len
     active_batch = active_seq_lens.numel()

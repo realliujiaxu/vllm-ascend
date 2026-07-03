@@ -26,7 +26,7 @@ from vllm.model_executor.layers.fused_moe import FusedMoEConfig
 import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
-from vllm_ascend.distributed.parallel_state import get_mc2_group
+from vllm_ascend.distributed.parallel_state import get_mega_moe_group
 from vllm_ascend.ops.fused_moe.moe_mlp import unified_apply_mlp
 from vllm_ascend.ops.fused_moe.moe_runtime_args import (
     MoEFusedExpertsInput,
@@ -51,14 +51,24 @@ from vllm_ascend.quantization.quant_type import QuantType
 
 _MoECommMethods: dict[MoECommType | None, MoECommMethod] = {}
 _MEGA_MOE_DISPATCH_QUANT_MODE_MX = 4
-_MEGA_MOE_DISPATCH_QUANT_OUT_TYPE_E5M2 = 23
 _MEGA_MOE_DISPATCH_QUANT_OUT_TYPE_E4M3FN = 24
+_MEGA_MOE_DISPATCH_QUANT_OUT_TYPE_E2M1FN_X2 = 296  # TODO(mega_moe): try torch.float4_e2m1fn_x2
+
+_MEGA_MOE_DISPATCH_QUANT_OUT_TYPE_BY_QUANT_TYPE: dict[QuantType, int] = {
+    QuantType.MXFP8: _MEGA_MOE_DISPATCH_QUANT_OUT_TYPE_E4M3FN,
+    QuantType.MXFP4: _MEGA_MOE_DISPATCH_QUANT_OUT_TYPE_E2M1FN_X2,
+    QuantType.W4A8MXFP: _MEGA_MOE_DISPATCH_QUANT_OUT_TYPE_E4M3FN,
+}
 
 
-def _get_dispatch_quant_out_type(dtype: torch.dtype | None) -> int:
-    if dtype == torch.float8_e5m2:
-        return _MEGA_MOE_DISPATCH_QUANT_OUT_TYPE_E5M2
-    return _MEGA_MOE_DISPATCH_QUANT_OUT_TYPE_E4M3FN
+def _get_mega_moe_dispatch_quant_out_type(quant_type: QuantType) -> int:
+    try:
+        return _MEGA_MOE_DISPATCH_QUANT_OUT_TYPE_BY_QUANT_TYPE[quant_type]
+    except KeyError as exc:
+        supported = sorted(t.name for t in _MEGA_MOE_DISPATCH_QUANT_OUT_TYPE_BY_QUANT_TYPE)
+        raise ValueError(
+            f"mega_moe does not support quant_type={quant_type}. Supported: {supported}"
+        ) from exc
 
 
 def get_moe_comm_method(moe_comm_type: MoECommType | None) -> MoECommMethod | None:
@@ -290,9 +300,10 @@ class FusedMC2CommImpl(MoECommMethod):
             self.expert_token_nums = None
         global mega_moe_symm_buffer
         if envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2 == 1:
+            quant_type = getattr(self.moe_config, "quant_type", QuantType.NONE)
             if mega_moe_symm_buffer is None:
                 mega_moe_symm_buffer = get_symm_buffer_for_mega_moe(
-                    group=get_mc2_group().device_group,
+                    group=get_mega_moe_group().device_group,
                     num_experts=self.moe_config.num_experts,
                     num_max_tokens_per_rank=0,
                     num_topk=self.moe_config.experts_per_token,
@@ -300,7 +311,7 @@ class FusedMC2CommImpl(MoECommMethod):
                     intermediate_hidden=2 * self.moe_config.intermediate_size_per_partition,
                     max_recv_token_num=65536 * 3,
                     dispatch_quant_mode=_MEGA_MOE_DISPATCH_QUANT_MODE_MX,
-                    dispatch_quant_out_type=_MEGA_MOE_DISPATCH_QUANT_OUT_TYPE_E4M3FN,
+                    dispatch_quant_out_type=_get_mega_moe_dispatch_quant_out_type(quant_type),
                 )
 
     def pad_and_split_input_ids(self, input_ids):
@@ -337,8 +348,8 @@ class FusedMC2CommImpl(MoECommMethod):
                 global mega_moe_symm_buffer
 
                 assert mega_moe_symm_buffer is not None, "mega_moe_symm_buffer should be initialized."
-                mega_moe_symm_buffer.dispatch_quant_out_type = _get_dispatch_quant_out_type(
-                    fused_experts_input.quant.mxfp.act_quant_type
+                mega_moe_symm_buffer.dispatch_quant_out_type = _get_mega_moe_dispatch_quant_out_type(
+                    fused_experts_input.quant.quant_type,
                 )
                 w1 = fused_experts_input.weights.w1
                 w2 = fused_experts_input.weights.w2

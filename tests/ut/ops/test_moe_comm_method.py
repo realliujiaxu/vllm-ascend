@@ -8,6 +8,9 @@ from vllm_ascend.ops.fused_moe.moe_comm_method import (
     AllGatherCommImpl,
     AlltoAllCommImpl,
     MC2CommImpl,
+    _MEGA_MOE_DISPATCH_QUANT_OUT_TYPE_E2M1FN_X2,
+    _MEGA_MOE_DISPATCH_QUANT_OUT_TYPE_E4M3FN,
+    _get_mega_moe_dispatch_quant_out_type,
 )
 from vllm_ascend.ops.fused_moe.moe_runtime_args import (
     MoEAllGatherCombineMetadata,
@@ -268,3 +271,27 @@ class TestMoECommMethod(TestBase):
             hidden_states=mock_unified_apply_mlp.return_value[0],
             combine_metadata=mock_td_instance.token_dispatch.return_value.combine_metadata,
         )
+
+
+class TestMegaMoeDispatchQuantOutType(TestBase):
+    def test_mxfp8_defaults_to_e4m3fn(self):
+        self.assertEqual(
+            _get_mega_moe_dispatch_quant_out_type(QuantType.MXFP8),
+            _MEGA_MOE_DISPATCH_QUANT_OUT_TYPE_E4M3FN,
+        )
+
+    def test_mxfp4_uses_e2m1fn_x2(self):
+        self.assertEqual(
+            _get_mega_moe_dispatch_quant_out_type(QuantType.MXFP4),
+            _MEGA_MOE_DISPATCH_QUANT_OUT_TYPE_E2M1FN_X2,
+        )
+
+    def test_w4a8_mxfp_defaults_to_e4m3fn(self):
+        self.assertEqual(
+            _get_mega_moe_dispatch_quant_out_type(QuantType.W4A8MXFP),
+            _MEGA_MOE_DISPATCH_QUANT_OUT_TYPE_E4M3FN,
+        )
+
+    def test_unsupported_quant_type_raises(self):
+        with self.assertRaises(ValueError):
+            _get_mega_moe_dispatch_quant_out_type(QuantType.W8A8)

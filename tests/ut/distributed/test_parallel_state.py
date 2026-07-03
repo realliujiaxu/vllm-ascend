@@ -9,6 +9,7 @@ from vllm_ascend.distributed.parallel_state import (
     _FLASHCOMM2_OTP,
     _LMTP,
     _MC2,
+    _MEGA_MOE,
     _OTP,
     _P_TP,
     destroy_ascend_model_parallel,
@@ -17,6 +18,7 @@ from vllm_ascend.distributed.parallel_state import (
     get_global_rank,
     get_lmhead_tp_group,
     get_mc2_group,
+    get_mega_moe_group,
     get_otp_group,
     get_p_tp_group,
     init_ascend_model_parallel,
@@ -71,12 +73,14 @@ def test_init_ascend_model_parallel(mock_distributed, parallel_config):
         init_ascend_model_parallel(parallel_config)
 
         mc2_group = get_mc2_group()
+        mega_moe_group = get_mega_moe_group()
         lmheadtp_group = get_lmhead_tp_group()
         otp_group = get_otp_group()
         flashcomm2_otp_group = get_flashcomm2_otp_group()
         flashcomm2_odp_group = get_flashcomm2_odp_group()
         p_tp_group = get_p_tp_group()
         assert mc2_group is not None
+        assert mega_moe_group is not None
         assert otp_group is not None
         assert flashcomm2_otp_group is not None
         assert flashcomm2_odp_group is not None
@@ -85,6 +89,7 @@ def test_init_ascend_model_parallel(mock_distributed, parallel_config):
 
         destroy_ascend_model_parallel()
         assert _MC2 is None
+        assert _MEGA_MOE is None
         assert _LMTP is None
         assert _OTP is None
         assert _FLASHCOMM2_OTP is None

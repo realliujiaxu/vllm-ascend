@@ -8,6 +8,9 @@ from vllm_ascend.utils import enable_dsa_cp_with_layer_shard, flashcomm2_enable
 # Currently, mc2 op need their own group coordinator.
 _MC2: GroupCoordinator | None = None
 
+# mega_moe op needs its own group coordinator.
+_MEGA_MOE: GroupCoordinator | None = None
+
 # Module specific tensor parallel groups
 _MLP_TP: GroupCoordinator | None = None
 _OTP: GroupCoordinator | None = None
@@ -94,6 +97,9 @@ def init_ascend_model_parallel(
 
     global _MC2
     _MC2 = init_model_parallel_group(group_ranks, get_world_group().local_rank, backend, group_name="mc2")
+
+    global _MEGA_MOE
+    _MEGA_MOE = init_model_parallel_group(group_ranks, get_world_group().local_rank, backend, group_name="mega_moe")
 
     if get_ascend_config().eplb_config.dynamic_eplb:
         global _DYNAMIC_EPLB
@@ -235,6 +241,11 @@ def get_mc2_group() -> GroupCoordinator:
     return _MC2
 
 
+def get_mega_moe_group() -> GroupCoordinator:
+    assert _MEGA_MOE is not None, "mega_moe group is not initialized"
+    return _MEGA_MOE
+
+
 def get_mlp_tp_group() -> GroupCoordinator:
     assert _MLP_TP is not None, "mlp group is not initialized"
     return _MLP_TP
@@ -289,6 +300,11 @@ def destroy_ascend_model_parallel():
     if _MC2:
         _MC2.destroy()
     _MC2 = None
+
+    global _MEGA_MOE
+    if _MEGA_MOE:
+        _MEGA_MOE.destroy()
+    _MEGA_MOE = None
 
     global _MLP_TP
     if _MLP_TP:

@@ -17,8 +17,8 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-
-from npu_ops_transformer.ops import get_symm_buffer_for_mega_moe, mega_moe
+import os
+from cann_ops_transformer.ops import get_mega_moe_ccl_buffer_size, get_symm_buffer_for_mega_moe, mega_moe
 
 import torch
 from vllm.model_executor.layers.fused_moe import FusedMoEConfig
@@ -26,7 +26,7 @@ from vllm.model_executor.layers.fused_moe import FusedMoEConfig
 import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
-from vllm_ascend.distributed.parallel_state import get_mega_moe_group
+from vllm_ascend.distributed.parallel_state import get_mega_moe_group, get_mc2_group
 from vllm_ascend.ops.fused_moe.moe_mlp import unified_apply_mlp
 from vllm_ascend.ops.fused_moe.moe_runtime_args import (
     MoEFusedExpertsInput,
@@ -294,25 +294,32 @@ class FusedMC2CommImpl(MoECommMethod):
 
     def __init__(self, moe_config):
         super().__init__(moe_config)
-        if envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2 == 1:
+        if get_ascend_config().enable_fused_mc2 == 1:
             self.expert_token_nums = torch.zeros([self.moe_config.num_local_experts], dtype=torch.int32, device="npu")
         else:
             self.expert_token_nums = None
         global mega_moe_symm_buffer
-        if envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2 == 1:
+        if get_ascend_config().enable_fused_mc2 == 1:
             quant_type = getattr(self.moe_config, "quant_type", QuantType.NONE)
             if mega_moe_symm_buffer is None:
+                buffer_size = get_mega_moe_ccl_buffer_size(
+                    8, self.moe_config.num_experts, 512, self.moe_config.experts_per_token, self.moe_config.hidden_dim,
+                    dispatch_quant_mode=4, dispatch_quant_out_dtype=296,
+                )
+                original_hccl_buffsize = os.environ['HCCL_BUFFSIZE']
+                os.environ['HCCL_BUFFSIZE'] = f'{buffer_size}'
                 mega_moe_symm_buffer = get_symm_buffer_for_mega_moe(
                     group=get_mega_moe_group().device_group,
-                    num_experts=self.moe_config.num_experts,
+                    num_experts=self.moe_config.num_experts, # 256
                     num_max_tokens_per_rank=0,
-                    num_topk=self.moe_config.experts_per_token,
-                    hidden=self.moe_config.hidden_dim,
-                    intermediate_hidden=2 * self.moe_config.intermediate_size_per_partition,
-                    max_recv_token_num=65536 * 3,
-                    dispatch_quant_mode=_MEGA_MOE_DISPATCH_QUANT_MODE_MX,
-                    dispatch_quant_out_type=_get_mega_moe_dispatch_quant_out_type(quant_type),
+                    num_topk=self.moe_config.experts_per_token, # 8
+                    hidden=self.moe_config.hidden_dim, # 6144
+                    intermediate_hidden=0,
+                    max_recv_token_num=0,
+                    dispatch_quant_mode=_MEGA_MOE_DISPATCH_QUANT_MODE_MX, # 4
+                    dispatch_quant_out_dtype=_get_mega_moe_dispatch_quant_out_type(quant_type), # 296
                 )
+                os.environ['HCCL_BUFFSIZE'] = original_hccl_buffsize
 
     def pad_and_split_input_ids(self, input_ids):
         return self.prepare_finalize.pad_and_split_input_ids(input_ids)  # type: ignore[attr-defined]

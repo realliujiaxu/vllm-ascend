@@ -251,12 +251,16 @@ class AscendW4A4MXFP4DynamicFusedMoEMethod(AscendMoEScheme):
         if get_ascend_config().enable_fused_mc2 == 1:
             # mega_moe (fused_mc2 + MXFP) requires FRACTAL_NZ weights.
             layer.w13_weight.data = torch_npu.npu_format_cast(
-                layer.w13_weight.data, 29, customize_dtype=torch.float8_e4m3fn, input_dtype=torch_npu.float4_e2m1fn_x2
+                layer.w13_weight.data, 29
             )
             layer.w2_weight.data = torch_npu.npu_format_cast(
                 layer.w2_weight.data, 29, customize_dtype=torch.float8_e4m3fn, input_dtype=torch_npu.float4_e2m1fn_x2
             )
             # TODO(mega_moe): check if this is needed.
+            g_num, n_size, k_size = layer.w13_weight_scale.shape
+            layer.w13_weight_scale.data = layer.w13_weight_scale.data.reshape(g_num, n_size, k_size // 2, 2)
+            g_num, n_size, k_size = layer.w2_weight_scale.shape
+            layer.w2_weight_scale.data = layer.w2_weight_scale.data.reshape(g_num, n_size, k_size // 2, 2)
             layer.w13_weight_scale.data = layer.w13_weight_scale.data.view(torch.float8_e8m0fnu)
             layer.w2_weight_scale.data = layer.w2_weight_scale.data.view(torch.float8_e8m0fnu)
             return

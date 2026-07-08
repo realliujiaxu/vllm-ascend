@@ -309,7 +309,7 @@ class FusedMC2CommImpl(MoECommMethod):
                 original_hccl_buffsize = os.environ['HCCL_BUFFSIZE']
                 os.environ['HCCL_BUFFSIZE'] = f'{buffer_size}'
                 mega_moe_symm_buffer = get_symm_buffer_for_mega_moe(
-                    group=get_mega_moe_group().device_group,
+                    group=get_mc2_group().device_group, # get_mega_moe_group().device_group,
                     num_experts=self.moe_config.num_experts, # 256
                     num_max_tokens_per_rank=0,
                     num_topk=self.moe_config.experts_per_token, # 8
@@ -372,6 +372,8 @@ class FusedMC2CommImpl(MoECommMethod):
                     sym_buffer=mega_moe_symm_buffer,
                     l1_weights_sf=w1_scale if isinstance(w1_scale, list) else [w1_scale],
                     l2_weights_sf=w2_scale if isinstance(w2_scale, list) else [w2_scale],
+                    weight1_type=296,
+                    weight2_type=296,
                 )
 
             else:

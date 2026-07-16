@@ -287,6 +287,9 @@ def _select_a5_moe_comm_method(
     vllm_config: VllmConfig,
     mc2_tokens_capacity: int,
 ) -> MoECommType:
+    mega_moe_tokens_capacity = 16384 # TODO(mega_moe): check it
+    if get_ascend_config().enable_fused_mc2 == 1 and num_tokens <= mega_moe_tokens_capacity:
+        return MoECommType.FUSED_MC2
     num_experts_per_tok = getattr(
         vllm_config.model_config.hf_text_config,
         "num_experts_per_tok",

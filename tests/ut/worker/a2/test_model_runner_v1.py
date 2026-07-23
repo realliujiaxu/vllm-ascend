@@ -4,9 +4,10 @@ from unittest.mock import MagicMock, patch
 
 import numpy as np
 import torch
-from vllm.model_executor.layers.attention import MLAAttention
+from vllm.model_executor.layers.attention import Attention, MLAAttention
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec, KVCacheTensor
 
+from vllm_ascend.core.kv_cache_interface import AscendGQAFp8AttentionSpec
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
 
@@ -85,6 +86,107 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
 
         self.assertEqual(k_cache.shape, (2, 16, 8, 64))
         self.assertEqual(v_cache.shape, (2, 16, 8, 64))
+
+    def test_allocate_and_reshape_minimax_m3_dense_fp8_cache(self):
+        runner = self._build_runner()
+        kv_cache_spec = AscendGQAFp8AttentionSpec(
+            block_size=16,
+            num_kv_heads=2,
+            head_size=64,
+            head_size_v=64,
+            dtype=torch.float8_e4m3fn,
+        )
+        kv_cache_config = KVCacheConfig(
+            num_blocks=2,
+            kv_cache_tensors=[
+                KVCacheTensor(
+                    size=kv_cache_spec.page_size_bytes * 2,
+                    shared_by=["dense_attn"],
+                )
+            ],
+            kv_cache_groups=[
+                KVCacheGroupSpec(
+                    layer_names=["dense_attn"],
+                    kv_cache_spec=kv_cache_spec,
+                )
+            ],
+        )
+
+        raw_caches = runner._allocate_kv_cache_tensors(kv_cache_config)
+        raw_k, raw_v, raw_k_scale = raw_caches["dense_attn"]
+        self.assertEqual(
+            raw_k.numel(),
+            kv_cache_spec.k_page_size_bytes * 2,
+        )
+        self.assertEqual(
+            raw_v.numel(),
+            kv_cache_spec.v_page_size_bytes * 2,
+        )
+        self.assertEqual(
+            raw_k_scale.numel(),
+            kv_cache_spec.k_scale_page_size_bytes * 2,
+        )
+
+        runner._kv_cache_spec_attn_group_iterator = lambda: [
+            SimpleNamespace(
+                kv_cache_spec=kv_cache_spec,
+                backend=runner.attn_backend,
+                layer_names=["dense_attn"],
+            )
+        ]
+        k_cache, v_cache, k_scale_cache = runner._reshape_kv_cache_tensors(
+            kv_cache_config,
+            raw_caches,
+        )["dense_attn"]
+
+        self.assertEqual(k_cache.shape, (2, 2, 16, 64))
+        self.assertEqual(v_cache.shape, (2, 2, 16, 64))
+        self.assertEqual(k_scale_cache.shape, (2, 2, 16, 1))
+        self.assertEqual(k_cache.dtype, torch.float8_e4m3fn)
+        self.assertEqual(v_cache.dtype, torch.float8_e4m3fn)
+        self.assertEqual(k_scale_cache.dtype, torch.float32)
+        torch.testing.assert_close(
+            k_scale_cache,
+            torch.ones_like(k_scale_cache),
+        )
+
+    @patch("vllm_ascend.worker.model_runner_v1.has_ec_transfer", return_value=False)
+    @patch("vllm_ascend.worker.model_runner_v1.get_layers_from_vllm_config")
+    def test_minimax_m3_dense_fp8_layer_uses_custom_spec(
+        self,
+        mock_get_layers,
+        _mock_has_ec_transfer,
+    ):
+        runner = self._build_runner()
+        runner.block_size = 16
+        runner.shared_kv_cache_layers = {}
+        runner.vllm_config.cache_config.cache_dtype = "fp8"
+
+        original_spec = FullAttentionSpec(
+            block_size=16,
+            num_kv_heads=2,
+            head_size=64,
+            head_size_v=64,
+            dtype=torch.float8_e4m3fn,
+        )
+        attn_module = Attention.__new__(Attention)
+        torch.nn.Module.__init__(attn_module)
+        attn_module.kv_sharing_target_layer_name = None
+        attn_module._ascend_minimax_m3_dense_gqa = True
+        attn_module.get_kv_cache_spec = MagicMock(return_value=original_spec)
+        layer_name = "model.layers.0.self_attn.attn"
+        mock_get_layers.return_value = {layer_name: attn_module}
+
+        spec = runner.get_kv_cache_spec()[layer_name]
+
+        self.assertIsInstance(spec, AscendGQAFp8AttentionSpec)
+        self.assertEqual(spec.dtype, torch.float8_e4m3fn)
+        self.assertEqual(
+            spec.page_size_bytes,
+            spec.k_page_size_bytes
+            + spec.v_page_size_bytes
+            + spec.k_scale_page_size_bytes,
+        )
 
     @patch("vllm_ascend.worker.model_runner_v1.has_ec_transfer", return_value=False)
     @patch("vllm_ascend.worker.model_runner_v1.get_layers_from_vllm_config")

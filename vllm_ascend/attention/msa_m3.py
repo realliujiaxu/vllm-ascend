@@ -1153,8 +1153,12 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
 
         vllm_config = get_current_vllm_config()
         self.layer_name = f"{prefix}.attn"
-        self.kv_cache_dtype = (
+        requested_kv_cache_dtype = (
             cache_config.cache_dtype if cache_config is not None else "auto"
+        )
+        # MiniMax M3 sparse attention does not support FP8 KV cache yet.
+        self.kv_cache_dtype = (
+            "bfloat16" if requested_kv_cache_dtype == "fp8" else requested_kv_cache_dtype
         )
         self.kv_cache_torch_dtype = kv_cache_dtype_str_to_dtype(
             self.kv_cache_dtype, vllm_config.model_config

@@ -82,19 +82,33 @@ class TestAscendAttentionBackend(TestBase):
         self.assertEqual(result, (2, 10, 20, 30, 40))
 
     def test_swap_blocks(self):
-        src_kv_cache = [torch.zeros((10, 20)), torch.zeros((10, 20))]
-        dst_kv_cache = [torch.zeros((10, 20)), torch.zeros((10, 20))]
+        src_kv_cache = [
+            torch.arange(10).view(10, 1).expand(10, 20),
+            torch.arange(10).view(10, 1).expand(10, 20),
+            torch.arange(10).view(10, 1).expand(10, 20),
+        ]
+        dst_kv_cache = [
+            torch.zeros((10, 20)),
+            torch.zeros((10, 20)),
+            torch.zeros((10, 20)),
+        ]
         src_to_dst = torch.tensor([[0, 1], [2, 3]])
         AscendAttentionBackend.swap_blocks(src_kv_cache, dst_kv_cache, src_to_dst)
         self.assertTrue(torch.all(dst_kv_cache[0][1] == src_kv_cache[0][0]))
         self.assertTrue(torch.all(dst_kv_cache[1][3] == src_kv_cache[1][2]))
+        self.assertTrue(torch.all(dst_kv_cache[2][3] == src_kv_cache[2][2]))
 
     def test_copy_blocks(self):
-        kv_caches = [torch.zeros((10, 20)), torch.zeros((10, 20))]
+        kv_cache = (
+            torch.arange(10).view(10, 1).expand(10, 20).clone(),
+            torch.arange(10).view(10, 1).expand(10, 20).clone(),
+            torch.arange(10).view(10, 1).expand(10, 20).clone(),
+        )
         src_to_dists = torch.tensor([[0, 1], [2, 3]])
-        AscendAttentionBackend.copy_blocks(kv_caches, src_to_dists)
-        self.assertTrue(torch.all(kv_caches[0][1] == kv_caches[0][0]))
-        self.assertTrue(torch.all(kv_caches[1][3] == kv_caches[1][2]))
+        AscendAttentionBackend.copy_blocks([kv_cache], src_to_dists)
+        self.assertTrue(torch.all(kv_cache[0][1] == kv_cache[0][0]))
+        self.assertTrue(torch.all(kv_cache[1][3] == kv_cache[1][2]))
+        self.assertTrue(torch.all(kv_cache[2][3] == kv_cache[2][2]))
 
 
 class TestAscendAttentionMetadataBuilder(TestBase):

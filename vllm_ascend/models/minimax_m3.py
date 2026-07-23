@@ -409,6 +409,9 @@ class MiniMaxM3Attention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.attn",
         )
+        # The model runner uses this explicit marker to attach the additional
+        # K-scale cache only to MiniMax M3 dense GQA layers.
+        self.attn._ascend_minimax_m3_dense_gqa = True
 
     def _qk_norm(
         self, q: torch.Tensor, k: torch.Tensor

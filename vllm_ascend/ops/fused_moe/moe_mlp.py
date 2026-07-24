@@ -157,7 +157,7 @@ def _swiglu_mx_quant(
             swiglu_mode=1,
             clamp_limit=swiglu_limit,
             glu_alpha=swiglu_alpha,
-            glu_beta=swiglu_beta,
+            glu_bias=swiglu_beta,
             group_mode=0,
             axis=-1,
             round_mode="rint",

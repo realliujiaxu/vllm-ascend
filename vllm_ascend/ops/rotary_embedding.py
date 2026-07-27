@@ -37,7 +37,7 @@ from vllm_ascend.utils import has_rope, is_vl_model
 if HAS_TRITON:
     from vllm.model_executor.layers.rotary_embedding.mrope import triton_mrope
 
-    from vllm_ascend.ops.triton.rope import rope_forward_triton
+    from vllm_ascend.ops.triton.rope import rope_forward_triton, rope_forward_triton_fp8
 
 # Currently, rope ops used on npu requires detached cos && sin as inputs.
 # However, RotaryEmbedding in vllm use cos_sin_cache as a whole variable.
@@ -237,6 +237,7 @@ class AscendRotaryEmbedding(RotaryEmbedding):
         key: torch.Tensor,
         offsets: torch.Tensor | None = None,
         is_neox_style_override: bool | None = None,
+        out_dtype: torch.dtype | None = None,
     ):
         is_neox_style = self.is_neox_style
         if is_neox_style_override is not None:
@@ -245,6 +246,49 @@ class AscendRotaryEmbedding(RotaryEmbedding):
         flash_comm_v1_enabled = _EXTRA_CTX.flash_comm_v1_enabled
         if is_draft_model and self.use_mtp and flash_comm_v1_enabled:
             positions = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(positions.contiguous(), True)
+
+        # MiniMax-M3 indexer FP8 path: RoPE in fp32, store e4m3 (storeElemsFp8).
+        if out_dtype == torch.float8_e4m3fn:
+            if not HAS_TRITON:
+                raise RuntimeError(
+                    "out_dtype=float8_e4m3fn requires Triton rope_forward_triton_fp8"
+                )
+            if key is None:
+                raise ValueError("out_dtype=float8_e4m3fn requires a key tensor")
+            query_shape, key_shape = query.shape, key.shape
+            num_tokens = query.shape[0]
+            # Indexer may use idx_head_dim != main head_size; infer from layout.
+            q_feat = query.numel() // num_tokens
+            k_feat = key.numel() // num_tokens
+            if q_feat % self.head_size == 0 and k_feat % self.head_size == 0:
+                head_size = self.head_size
+            else:
+                head_size = k_feat
+                if q_feat % head_size != 0:
+                    raise ValueError(
+                        f"Cannot infer head size for FP8 RoPE: "
+                        f"q_feat={q_feat}, k_feat={k_feat}, "
+                        f"emb.head_size={self.head_size}"
+                    )
+            rope_dim = min(self.rotary_dim, head_size)
+            q = query.view(num_tokens, -1, head_size).contiguous()
+            k = key.view(num_tokens, -1, head_size).contiguous()
+            q_fp8, k_fp8 = rope_forward_triton_fp8(
+                q,
+                k,
+                cos_sin_cache=self.cos_sin_cache,
+                positions=positions,
+                rope_dim=rope_dim,
+                is_neox_style=is_neox_style,
+            )
+            return q_fp8.view(query_shape), k_fp8.view(key_shape)
+
+        if out_dtype is not None:
+            raise NotImplementedError(
+                f"AscendRotaryEmbedding out_dtype={out_dtype!r} is not supported "
+                "(only None or torch.float8_e4m3fn)."
+            )
+
         return torch.ops.vllm.npu_rotary_embedding(
             positions, query, key, self.cos_sin_cache, self.head_size, self.rotary_dim, is_neox_style
         )
@@ -291,8 +335,17 @@ class AscendYaRNRotaryEmbedding(YaRNScalingRotaryEmbedding):
         key: torch.Tensor,
         offsets: torch.Tensor | None = None,
         is_neox_style_override: bool | None = None,
+        out_dtype: torch.dtype | None = None,
     ):
-        return AscendRotaryEmbedding.forward_oot(self, positions, query, key, offsets, is_neox_style_override)
+        return AscendRotaryEmbedding.forward_oot(
+            self,
+            positions,
+            query,
+            key,
+            offsets,
+            is_neox_style_override,
+            out_dtype,
+        )
 
 
 class AscendDeepseekScalingRotaryEmbedding(DeepseekScalingRotaryEmbedding):

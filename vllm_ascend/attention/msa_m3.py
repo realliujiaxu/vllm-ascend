@@ -73,12 +73,24 @@ def _scatter_index_cache(
     updates: torch.Tensor,
     slot_mapping: torch.Tensor,
 ) -> None:
-    """Write index keys while safely ignoring graph/parallel padding slots."""
+    """Write index keys while safely ignoring graph/parallel padding slots.
+
+    ``updates`` must already match ``cache.dtype`` (cast at the call site /
+    before insert). For ``float8_e4m3fn``, NPU scatter lacks e4m3 support, so
+    the write is done via a uint8 bitcast (same bytes, no extra quant).
+    """
     slots = slot_mapping.reshape(-1)
     if slots.numel() == 0:
         return
 
     updates = updates.reshape(slots.shape[0], cache.shape[-1])
+    if updates.dtype != cache.dtype:
+        updates = updates.to(cache.dtype)
+
+    if cache.dtype == torch.float8_e4m3fn:
+        cache = cache.view(torch.uint8)
+        updates = updates.view(torch.uint8)
+
     valid = slots >= 0
     first_valid_idx = torch.argmax(valid.to(torch.int32)).reshape(1)
     has_valid = valid.any()
@@ -232,11 +244,21 @@ class AscendMiniMaxM3IndexerCache(nn.Module, AttentionLayerBase):
         head_dim: int,
         prefix: str,
         cache_config: CacheConfig | None = None,
+        indexer_kv_dtype: str = "bf16",
     ) -> None:
         super().__init__()
         self.kv_cache = torch.tensor([])
         self.head_dim = head_dim
-        self.dtype = torch.bfloat16
+        if indexer_kv_dtype in ("fp8", "fp8_e4m3"):
+            self.dtype = torch.float8_e4m3fn
+        elif indexer_kv_dtype == "bf16":
+            self.dtype = torch.bfloat16
+        else:
+            raise NotImplementedError(
+                f"indexer_kv_dtype={indexer_kv_dtype!r} is not supported "
+                "(only 'bf16' or 'fp8'/'fp8_e4m3')."
+            )
+        self.indexer_kv_dtype = indexer_kv_dtype
         self.prefix = prefix
         self.cache_config = cache_config
         compilation_config = get_current_vllm_config().compilation_config
@@ -413,6 +435,7 @@ class AscendMiniMaxM3IndexerImpl(nn.Module):
         init_blocks: int = 0,
         local_blocks: int = 0,
         cache_config: CacheConfig | None = None,
+        indexer_kv_dtype: str = "bf16",
     ) -> None:
         super().__init__()
         self.num_kv_heads = num_kv_heads
@@ -427,6 +450,7 @@ class AscendMiniMaxM3IndexerImpl(nn.Module):
             head_dim=index_head_dim,
             prefix=f"{prefix}.index_cache",
             cache_config=cache_config,
+            indexer_kv_dtype=indexer_kv_dtype,
         )
 
     def forward(
@@ -504,6 +528,7 @@ class AscendMiniMaxM3Indexer(nn.Module):
         init_blocks: int = 0,
         local_blocks: int = 0,
         cache_config: CacheConfig | None = None,
+        indexer_kv_dtype: str = "bf16",
     ) -> None:
         super().__init__()
         self.impl = AscendMiniMaxM3IndexerImpl(
@@ -517,6 +542,7 @@ class AscendMiniMaxM3Indexer(nn.Module):
             init_blocks=init_blocks,
             local_blocks=local_blocks,
             cache_config=cache_config,
+            indexer_kv_dtype=indexer_kv_dtype,
         )
 
     @property
@@ -1153,6 +1179,7 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
 
         vllm_config = get_current_vllm_config()
         self.layer_name = f"{prefix}.attn"
+        self.indexer_kv_dtype = vllm_config.attention_config.indexer_kv_dtype
         self.kv_cache_dtype = (
             cache_config.cache_dtype if cache_config is not None else "auto"
         )
@@ -1182,6 +1209,7 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             init_blocks=sparse_cfg.get("sparse_init_block", 0),
             local_blocks=sparse_cfg.get("sparse_local_block", 0),
             cache_config=cache_config,
+            indexer_kv_dtype=self.indexer_kv_dtype,
         )
 
         compilation_config = vllm_config.compilation_config
@@ -1245,9 +1273,14 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         if isinstance(idx_cache, (tuple, list)):
             idx_cache = idx_cache[0]
         flat = idx_cache.view(-1, self.idx_head_dim)
+        cache_dtype = flat.dtype
+        src = index_key[:num_tokens]
+        if src.ndim == 3:
+            src = src.reshape(num_tokens, -1)
+        src = src.to(dtype=cache_dtype)
         _scatter_index_cache(
             flat,
-            index_key[:num_tokens].to(flat.dtype),
+            src,
             index_meta.slot_mapping[:num_tokens],
         )
 
@@ -1289,7 +1322,17 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             )
 
         index_q, index_k = self._index_qk_norm(index_q, index_k)
-        index_q, index_k = self.rotary_emb(positions, index_q, index_k)
+        # Indexer FP8: rotary_emb(..., out_dtype=e4m3) → Triton FP8 RoPE.
+        # Main Q/K above stay bf16. index_q/index_k then feed insert_kv + score.
+        if self.indexer_kv_dtype in ("fp8", "fp8_e4m3"):
+            index_q, index_k = self.rotary_emb(
+                positions,
+                index_q,
+                index_k,
+                out_dtype=torch.float8_e4m3fn,
+            )
+        else:
+            index_q, index_k = self.rotary_emb(positions, index_q, index_k)
 
         return q, k, v, index_q, index_k
 

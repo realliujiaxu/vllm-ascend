@@ -50,9 +50,12 @@ from vllm_ascend.attention.msa_m3_triton import (
     minimax_m3_index_score,
     minimax_m3_index_topk,
 )
+from vllm_ascend.attention.msa_m3_npu import (
+    minimax_m3_sparse_attn as minimax_m3_sparse_attn_ascendc_legacy,
+    minimax_m3_sparse_attn_decode as minimax_m3_sparse_attn_decode_ascendc,
+)
 from vllm_ascend.attention.msa_m3_npu_new import (
-    minimax_m3_sparse_attn as minimax_m3_sparse_attn_ascendc,
-    minimax_m3_sparse_attn_decode as minimax_m3_sparse_attn_decode_ascendc
+    minimax_m3_sparse_attn as minimax_m3_sparse_attn_ascendc_pp8,
 )
 from vllm_ascend.attention.msa_m3_ops import (
     minimax_m3_sparse_attn_torch as minimax_m3_sparse_attn,
@@ -64,6 +67,8 @@ from vllm_ascend.ops.linear_op import get_parallel_op
 
 
 logger = init_logger(__name__)
+
+_SPARSE_ATTN_NEW_OP_PP_SIZE = 8
 
 _SPARSE_ATTN_LOGGED = False
 
@@ -770,6 +775,17 @@ class AscendMiniMaxM3SparseImpl(AttentionImplBase[AscendMiniMaxM3SparseMetadata]
         self.kv_cache_dtype = kv_cache_dtype
         self.topk_blocks = topk_blocks
         self.block_size = sparse_block_size
+        try:
+            pp_size = (
+                get_current_vllm_config().parallel_config.pipeline_parallel_size
+            )
+        except Exception:
+            pp_size = 1
+        self.minimax_m3_sparse_attn_ascendc = (
+            minimax_m3_sparse_attn_ascendc_pp8
+            if pp_size == _SPARSE_ATTN_NEW_OP_PP_SIZE
+            else minimax_m3_sparse_attn_ascendc_legacy
+        )
 
     def forward(
         self,
@@ -887,7 +903,7 @@ class AscendMiniMaxM3SparseImpl(AttentionImplBase[AscendMiniMaxM3SparseMetadata]
         if main_md.num_prefills > 0:
             p = main_md.prefill
             assert p is not None and prefill_topk is not None
-            minimax_m3_sparse_attn_ascendc(
+            self.minimax_m3_sparse_attn_ascendc(
                 q[nd:],
                 kv_cache,
                 prefill_topk,

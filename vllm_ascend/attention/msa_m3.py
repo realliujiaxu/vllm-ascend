@@ -81,8 +81,12 @@ def _scatter_index_cache(
     """Write index keys while safely ignoring graph/parallel padding slots.
 
     ``updates`` must already match ``cache.dtype`` (cast at the call site /
-    before insert). For ``float8_e4m3fn``, NPU scatter lacks e4m3 support, so
-    the write is done via a uint8 bitcast (same bytes, no extra quant).
+    before insert). Uses CANN ScatterPaCache
+    (``torch_npu.npu_scatter_pa_cache``) scene-1:
+    ``key [T,1,D]`` -> ``keyCache [B, block_size, 1, D]``.
+
+    For ``float8_e4m3fn``, the PA scatter op accepts e4m3 natively (no uint8
+    bitcast). Padding slots (``slot < 0``) are ignored by the op.
     """
     slots = slot_mapping.reshape(-1)
     if slots.numel() == 0:
@@ -92,42 +96,20 @@ def _scatter_index_cache(
     if updates.dtype != cache.dtype:
         updates = updates.to(cache.dtype)
 
-    if cache.dtype == torch.float8_e4m3fn:
-        cache = cache.view(torch.uint8)
-        updates = updates.view(torch.uint8)
-
-    valid = slots >= 0
-    first_valid_idx = torch.argmax(valid.to(torch.int32)).reshape(1)
-    has_valid = valid.any()
-
-    # Keep the index on device. Tensor scalar indexing would invoke
-    # _local_scalar_dense and synchronize a copy stream, which is unsupported
-    # while an ACL graph is being captured.
-    first_valid_slot = torch.index_select(slots, 0, first_valid_idx).squeeze(0)
-    first_valid_update = torch.index_select(
-        updates, 0, first_valid_idx
-    ).squeeze(0)
-
-    # A5 ScatterNdUpdate requires in-range indices. Redirect padding to the
-    # first valid slot with that slot's same update, making duplicates harmless.
-    # If the whole batch is padding, write cache[0] back to itself.
-    fallback_slot = torch.where(
-        has_valid,
-        first_valid_slot,
-        slots.new_zeros(()),
-    )
-    fallback_update = torch.where(
-        has_valid,
-        first_valid_update,
-        cache[0],
-    )
-    safe_slots = torch.where(valid, slots, fallback_slot).view(-1, 1)
-    safe_updates = torch.where(
-        valid.view(-1, 1),
-        updates,
-        fallback_update.view(1, -1),
-    )
-    torch_npu.npu_scatter_nd_update_(cache, safe_slots, safe_updates)
+    head_dim = cache.shape[-1]
+    slots = slots.contiguous()
+    num_tokens = slots.numel()
+    if cache.ndim == 2:
+        num_blocks = cache.shape[0] // SPARSE_BLOCK_SIZE
+        pa_cache = cache.view(num_blocks, SPARSE_BLOCK_SIZE, 1, head_dim)
+    elif cache.ndim == 3:
+        pa_cache = cache.unsqueeze(2)
+    elif cache.ndim == 4:
+        pa_cache = cache
+    else:
+        raise ValueError(f"Unexpected index cache ndim: {cache.ndim}")
+    key = updates.reshape(num_tokens, 1, head_dim).contiguous()
+    torch_npu.npu_scatter_pa_cache(key, slots, key_cache=pa_cache)
 
 
 def _select_num_idx_from_topk(topk_idx: torch.Tensor) -> torch.Tensor:

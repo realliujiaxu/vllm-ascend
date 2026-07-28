@@ -15,9 +15,12 @@
 # This file is a part of the vllm-ascend project.
 
 
+import os
+
 import torch
 import torch_npu
 from torch.nn.functional import pad
+from vllm.logger import logger
 from vllm.triton_utils import HAS_TRITON
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
@@ -129,30 +132,38 @@ def _swiglu_mx_quant(
     swiglu_alpha: float,
     swiglu_beta: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if ASCEND_DEVICE_TYPE != AscendDeviceType.A5:
-        raise RuntimeError("swiglu_mx_quant is only expected on Ascend A5.")
-    if not hasattr(torch.ops._C_ascend, "swiglu_mx_quant"):
-        raise RuntimeError(
-            "swiglu_mx_quant is unavailable in the current Ascend custom op "
-            "runtime. Please update the A5 custom op package."
+    ld_library_path = os.environ.get("LD_LIBRARY_PATH", "")
+    if "vendors/custom_nn" not in ld_library_path:
+        logger.warning_once(
+            "swiglu_mx_quant custom op not found in LD_LIBRARY_PATH. "
+            "Falling back to _apply_clipped_swiglu + npu_dynamic_mx_quant."
         )
-
-    hidden_states, swiglu_out_scale = torch.ops._C_ascend.swiglu_mx_quant(
-        x=hidden_states,
-        group_index=None,
-        dst_type=act_quant_type,
-        activate_dim=-1,
-        activate_left=True,
-        swiglu_mode=1,
-        clamp_limit=swiglu_limit,
-        glu_alpha=swiglu_alpha,
-        glu_bias=swiglu_beta,
-        group_mode=0,
-        axis=-1,
-        round_mode="rint",
-        scale_alg=1,
-        max_dtype_value=0.0,
-    )
+        hidden_states = _apply_clipped_swiglu(
+            hidden_states,
+            swiglu_limit=swiglu_limit,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+        )
+        hidden_states, swiglu_out_scale = torch_npu.npu_dynamic_mx_quant(
+            hidden_states, dst_type=act_quant_type, scale_alg=1
+        )
+    else:
+        hidden_states, swiglu_out_scale = torch_npu.npu_swiglu_mx_quant(
+            hidden_states,
+            group_index=None,
+            dst_type=act_quant_type,
+            activate_dim=-1,
+            activate_left=True,
+            swiglu_mode=1,
+            clamp_limit=swiglu_limit,
+            glu_alpha=swiglu_alpha,
+            glu_bias=swiglu_beta,
+            group_mode=0,
+            axis=-1,
+            round_mode="rint",
+            scale_alg=1,
+            max_dtype_value=0.0,
+        )
     return hidden_states, DeviceOperator.maybe_normalize_mxfp_scale_layout(swiglu_out_scale)
 
 

@@ -687,7 +687,7 @@ def minimax_m3_index_score(
         dtype=torch.float32,
         device=idx_q.device,
     )
-    BLOCK_SIZE_Q = 256
+    BLOCK_SIZE_Q = 128
     grid_score = (triton.cdiv(max_query_len, BLOCK_SIZE_Q), batch * num_idx_heads)
     _index_block_score_kernel[grid_score](
         idx_q,

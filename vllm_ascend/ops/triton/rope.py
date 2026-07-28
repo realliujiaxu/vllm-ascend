@@ -23,6 +23,13 @@ from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
 _FP8_E4M3_MAX = 448.0
 
 
+def _fp8_rope_head_block(n_heads: int, cap: int = 16) -> int:
+    """Tight head tile sized to actual head count (avoid BLOCK=64 mask waste)."""
+    if n_heads <= 0:
+        return 1
+    return min(triton.next_power_of_2(n_heads), cap)
+
+
 @triton.jit
 def _store_fp8_e4m3(dst_ptr, offsets, vals_fp32, mask, FP8_MAX: tl.constexpr):
     """fp32 -> clamp(+/-448) -> e4m3 store. Same semantics as CUDA storeElemsFp8."""
@@ -272,10 +279,6 @@ def _triton_rope_fp8(
     q_out_row_stride,
     k_out_ptr,
     k_out_row_stride,
-    cos_ptr,
-    cos_row_stride,
-    sin_ptr,
-    sin_row_stride,
     cos_sin_ptr,
     cos_sin_row_stride,
     pos_ptr,
@@ -284,186 +287,135 @@ def _triton_rope_fp8(
     n_kh: tl.constexpr,
     hd: tl.constexpr,
     rope_dim: tl.constexpr,
-    pad_rope_dim: tl.constexpr,
-    pad_pass_dim: tl.constexpr,
+    pad_half: tl.constexpr,
+    pad_pass: tl.constexpr,
     pass_dim: tl.constexpr,
-    BLOCK_SIZE_HEAD: tl.constexpr,
-    IS_NEOX_STYLE: tl.constexpr,
-    USE_COS_SIN: tl.constexpr,
+    BLOCK_QH: tl.constexpr,
+    BLOCK_KH: tl.constexpr,
     FP8_MAX: tl.constexpr,
 ):
-    """RoPE for q/k with direct fp32 -> e4m3 store (no bf16 materialization).
+    """NeoX + cos_sin_cache fused RoPE->e4m3 (prefill and decode).
 
-    Same layout / NeoX|GPT-J patterns as ``_triton_rope``. Reads bf16/fp16,
-    computes RoPE in fp32, then stores clamp(+/-448) -> float8_e4m3fn into
-    ``q_out`` / ``k_out``. Pass-through dims ``[rope_dim, hd)`` are also
-    quantized to e4m3. Matches vLLM CUDA ``storeElemsFp8`` (no scale).
+    Tight ``BLOCK_QH``/``BLOCK_KH`` head tiles and a larger token grid.
     """
     pid = tl.program_id(0).to(tl.int64)
     row_block_size = tl.num_programs(0)
+    half: tl.constexpr = rope_dim // 2
+    cos_offsets = tl.arange(0, pad_half)
+    cos_mask = cos_offsets < half
 
     for row_idx in tl.range(pid, num_tokens, row_block_size):
-        q_row_start_ptr = q_ptr + row_idx * q_row_stride
-        k_row_start_ptr = k_ptr + row_idx * k_row_stride
-        q_out_row_start_ptr = q_out_ptr + row_idx * q_out_row_stride
-        k_out_row_start_ptr = k_out_ptr + row_idx * k_out_row_stride
+        pos_idx = tl.load(pos_ptr + row_idx).to(tl.int64)
+        cos_start_ptr = cos_sin_ptr + pos_idx * cos_sin_row_stride
+        cos_row = tl.load(cos_start_ptr + cos_offsets, mask=cos_mask, other=0).to(
+            tl.float32
+        )
+        sin_row = tl.load(
+            cos_start_ptr + half + cos_offsets, mask=cos_mask, other=0
+        ).to(tl.float32)
 
-        cos_offsets = tl.arange(0, pad_rope_dim // 2)
-        sin_offsets = tl.arange(pad_rope_dim // 2, pad_rope_dim)
-        cos_mask = cos_offsets < (rope_dim // 2)
-        if USE_COS_SIN:
-            pos_idx = tl.load(pos_ptr + row_idx).to(tl.int64)
-            cos_start_ptr = cos_sin_ptr + pos_idx * cos_sin_row_stride
-            cos_row = tl.load(cos_start_ptr + cos_offsets, mask=cos_mask, other=0).to(
-                tl.float32
-            )
-            sin_row = tl.load(cos_start_ptr + sin_offsets, mask=cos_mask, other=0).to(
-                tl.float32
-            )
-        else:
-            cos_start_ptr = cos_ptr + row_idx * cos_row_stride
-            sin_start_ptr = sin_ptr + row_idx * sin_row_stride
-            cos_row = tl.load(cos_start_ptr + cos_offsets, mask=cos_mask, other=0).to(
-                tl.float32
-            )
-            sin_row = tl.load(sin_start_ptr + cos_offsets, mask=cos_mask, other=0).to(
-                tl.float32
-            )
+        q_row = q_ptr + row_idx * q_row_stride
+        q_out_row = q_out_ptr + row_idx * q_out_row_stride
+        for q_base in tl.range(0, n_qh, BLOCK_QH):
+            q_heads = tl.arange(0, BLOCK_QH)
+            head_ok = (q_base + q_heads)[:, None] < n_qh
+            base = q_row + q_base * hd
+            out_base = q_out_row + q_base * hd
 
-        for q_head_base in tl.range(0, n_qh, BLOCK_SIZE_HEAD):
-            q_tile_start_ptr = q_row_start_ptr + q_head_base * hd
-            q_out_tile_start_ptr = q_out_row_start_ptr + q_head_base * hd
-            q_heads = tl.arange(0, BLOCK_SIZE_HEAD)
-            head_ok = (q_head_base + q_heads)[:, None] < n_qh
-
+            half_offs = tl.arange(0, pad_half)
+            half_mask = head_ok & (half_offs[None, :] < half)
+            x1 = tl.load(
+                base + q_heads[:, None] * hd + half_offs[None, :],
+                mask=half_mask,
+                other=0,
+            ).to(tl.float32)
+            x2 = tl.load(
+                base + q_heads[:, None] * hd + half + half_offs[None, :],
+                mask=half_mask,
+                other=0,
+            ).to(tl.float32)
+            o1 = x1 * cos_row - x2 * sin_row
+            o2 = x2 * cos_row + x1 * sin_row
+            _store_fp8_e4m3(
+                out_base,
+                q_heads[:, None] * hd + half_offs[None, :],
+                o1,
+                half_mask,
+                FP8_MAX,
+            )
+            _store_fp8_e4m3(
+                out_base,
+                q_heads[:, None] * hd + half + half_offs[None, :],
+                o2,
+                half_mask,
+                FP8_MAX,
+            )
             if pass_dim > 0:
-                pass_offsets = (
-                    q_heads[:, None] * hd + rope_dim + tl.arange(0, pad_pass_dim)[None, :]
-                )
-                pass_mask = head_ok & (tl.arange(0, pad_pass_dim)[None, :] < pass_dim)
+                pass_offs = tl.arange(0, pad_pass)
+                pass_mask = head_ok & (pass_offs[None, :] < pass_dim)
                 pass_vals = tl.load(
-                    q_tile_start_ptr + pass_offsets, mask=pass_mask, other=0
+                    base + q_heads[:, None] * hd + rope_dim + pass_offs[None, :],
+                    mask=pass_mask,
+                    other=0,
                 ).to(tl.float32)
                 _store_fp8_e4m3(
-                    q_out_tile_start_ptr, pass_offsets, pass_vals, pass_mask, FP8_MAX
-                )
-
-            if IS_NEOX_STYLE:
-                first_half_q_offsets = (
-                    q_heads[:, None] * hd + tl.arange(0, pad_rope_dim // 2)[None, :]
-                )
-                first_q_mask = head_ok & (
-                    tl.arange(0, pad_rope_dim // 2)[None, :] < (rope_dim // 2)
-                )
-                q_tile_1 = tl.load(
-                    q_tile_start_ptr + first_half_q_offsets, mask=first_q_mask, other=0
-                ).to(tl.float32)
-                second_half_q_offsets = first_half_q_offsets + (rope_dim // 2)
-                q_tile_2 = tl.load(
-                    q_tile_start_ptr + second_half_q_offsets, mask=first_q_mask, other=0
-                ).to(tl.float32)
-                new_q_tile_1 = q_tile_1 * cos_row - q_tile_2 * sin_row
-                new_q_tile_2 = q_tile_2 * cos_row + q_tile_1 * sin_row
-                _store_fp8_e4m3(
-                    q_out_tile_start_ptr,
-                    first_half_q_offsets,
-                    new_q_tile_1,
-                    first_q_mask,
+                    out_base,
+                    q_heads[:, None] * hd + rope_dim + pass_offs[None, :],
+                    pass_vals,
+                    pass_mask,
                     FP8_MAX,
                 )
-                _store_fp8_e4m3(
-                    q_out_tile_start_ptr,
-                    second_half_q_offsets,
-                    new_q_tile_2,
-                    first_q_mask,
-                    FP8_MAX,
-                )
-            else:
-                pair_offsets = (
-                    q_heads[:, None, None] * hd
-                    + (2 * tl.arange(0, pad_rope_dim // 2)[None, :, None])
-                    + tl.arange(0, 2)[None, None, :]
-                )
-                pair_mask = ((q_head_base + q_heads)[:, None, None] < n_qh) & (
-                    tl.arange(0, pad_rope_dim // 2)[None, :, None] < (rope_dim // 2)
-                )
-                q_tile = tl.load(
-                    q_tile_start_ptr + pair_offsets, mask=pair_mask, other=0
-                ).to(tl.float32)
-                q_tile_1, q_tile_2 = tl.split(q_tile)
-                new_q_tile_1 = q_tile_1 * cos_row - q_tile_2 * sin_row
-                new_q_tile_2 = q_tile_2 * cos_row + q_tile_1 * sin_row
-                q_tile_out = tl.join(new_q_tile_1, new_q_tile_2)
-                _store_fp8_e4m3(
-                    q_out_tile_start_ptr, pair_offsets, q_tile_out, pair_mask, FP8_MAX
-                )
 
-        for k_head_base in tl.range(0, n_kh, BLOCK_SIZE_HEAD):
-            k_tile_start_ptr = k_row_start_ptr + k_head_base * hd
-            k_out_tile_start_ptr = k_out_row_start_ptr + k_head_base * hd
-            k_heads = tl.arange(0, BLOCK_SIZE_HEAD)
-            head_ok = (k_head_base + k_heads)[:, None] < n_kh
+        k_row = k_ptr + row_idx * k_row_stride
+        k_out_row = k_out_ptr + row_idx * k_out_row_stride
+        for k_base in tl.range(0, n_kh, BLOCK_KH):
+            k_heads = tl.arange(0, BLOCK_KH)
+            head_ok = (k_base + k_heads)[:, None] < n_kh
+            base = k_row + k_base * hd
+            out_base = k_out_row + k_base * hd
 
+            half_offs = tl.arange(0, pad_half)
+            half_mask = head_ok & (half_offs[None, :] < half)
+            x1 = tl.load(
+                base + k_heads[:, None] * hd + half_offs[None, :],
+                mask=half_mask,
+                other=0,
+            ).to(tl.float32)
+            x2 = tl.load(
+                base + k_heads[:, None] * hd + half + half_offs[None, :],
+                mask=half_mask,
+                other=0,
+            ).to(tl.float32)
+            o1 = x1 * cos_row - x2 * sin_row
+            o2 = x2 * cos_row + x1 * sin_row
+            _store_fp8_e4m3(
+                out_base,
+                k_heads[:, None] * hd + half_offs[None, :],
+                o1,
+                half_mask,
+                FP8_MAX,
+            )
+            _store_fp8_e4m3(
+                out_base,
+                k_heads[:, None] * hd + half + half_offs[None, :],
+                o2,
+                half_mask,
+                FP8_MAX,
+            )
             if pass_dim > 0:
-                pass_offsets = (
-                    k_heads[:, None] * hd + rope_dim + tl.arange(0, pad_pass_dim)[None, :]
-                )
-                pass_mask = head_ok & (tl.arange(0, pad_pass_dim)[None, :] < pass_dim)
+                pass_offs = tl.arange(0, pad_pass)
+                pass_mask = head_ok & (pass_offs[None, :] < pass_dim)
                 pass_vals = tl.load(
-                    k_tile_start_ptr + pass_offsets, mask=pass_mask, other=0
+                    base + k_heads[:, None] * hd + rope_dim + pass_offs[None, :],
+                    mask=pass_mask,
+                    other=0,
                 ).to(tl.float32)
                 _store_fp8_e4m3(
-                    k_out_tile_start_ptr, pass_offsets, pass_vals, pass_mask, FP8_MAX
-                )
-
-            if IS_NEOX_STYLE:
-                first_half_k_offsets = (
-                    k_heads[:, None] * hd + tl.arange(0, pad_rope_dim // 2)[None, :]
-                )
-                first_k_mask = head_ok & (
-                    tl.arange(0, pad_rope_dim // 2)[None, :] < (rope_dim // 2)
-                )
-                k_tile_1 = tl.load(
-                    k_tile_start_ptr + first_half_k_offsets, mask=first_k_mask, other=0
-                ).to(tl.float32)
-                second_half_k_offsets = first_half_k_offsets + (rope_dim // 2)
-                k_tile_2 = tl.load(
-                    k_tile_start_ptr + second_half_k_offsets, mask=first_k_mask, other=0
-                ).to(tl.float32)
-                new_k_tile_1 = k_tile_1 * cos_row - k_tile_2 * sin_row
-                new_k_tile_2 = k_tile_2 * cos_row + k_tile_1 * sin_row
-                _store_fp8_e4m3(
-                    k_out_tile_start_ptr,
-                    first_half_k_offsets,
-                    new_k_tile_1,
-                    first_k_mask,
+                    out_base,
+                    k_heads[:, None] * hd + rope_dim + pass_offs[None, :],
+                    pass_vals,
+                    pass_mask,
                     FP8_MAX,
-                )
-                _store_fp8_e4m3(
-                    k_out_tile_start_ptr,
-                    second_half_k_offsets,
-                    new_k_tile_2,
-                    first_k_mask,
-                    FP8_MAX,
-                )
-            else:
-                pair_offsets = (
-                    k_heads[:, None, None] * hd
-                    + (2 * tl.arange(0, pad_rope_dim // 2)[None, :, None])
-                    + tl.arange(0, 2)[None, None, :]
-                )
-                pair_mask = ((k_head_base + k_heads)[:, None, None] < n_kh) & (
-                    tl.arange(0, pad_rope_dim // 2)[None, :, None] < (rope_dim // 2)
-                )
-                k_tile = tl.load(
-                    k_tile_start_ptr + pair_offsets, mask=pair_mask, other=0
-                ).to(tl.float32)
-                k_tile_1, k_tile_2 = tl.split(k_tile)
-                new_k_tile_1 = k_tile_1 * cos_row - k_tile_2 * sin_row
-                new_k_tile_2 = k_tile_2 * cos_row + k_tile_1 * sin_row
-                k_tile_out = tl.join(new_k_tile_1, new_k_tile_2)
-                _store_fp8_e4m3(
-                    k_out_tile_start_ptr, pair_offsets, k_tile_out, pair_mask, FP8_MAX
                 )
 
 
@@ -651,12 +603,10 @@ def rope_forward_triton_fp8(
     q_out: torch.Tensor | None = None,
     k_out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """RoPE with direct fp32 -> float8_e4m3fn store (no intermediate bf16).
+    """RoPE with float8_e4m3fn outputs (storeElemsFp8 semantics, no scale).
 
-    Same calling convention as ``rope_forward_triton``. Input ``q``/``k`` stay
-    bf16/fp16; RoPE is computed in fp32 and written as
-    ``clamp(+/-448).to(float8_e4m3fn)`` into ``q_out``/``k_out`` (vLLM CUDA
-    ``storeElemsFp8`` semantics, no scale).
+    NeoX + cos_sin_cache path used by MiniMax-M3 indexer. Input ``q``/``k`` stay
+    bf16/fp16; RoPE is computed in fp32 and written as e4m3 into ``q_out``/``k_out``.
     """
     if not q.is_contiguous():
         q = q.contiguous()
@@ -680,91 +630,44 @@ def rope_forward_triton_fp8(
     if not q_out.is_contiguous() or not k_out.is_contiguous():
         raise ValueError("q_out / k_out must be contiguous")
 
-    if is_neox_style:
-        block_size_head = 64
-    else:
-        block_size_head = 32
-    if head_dim >= 256:
-        block_size_head = min(block_size_head, 16)
-    n_row = min(num_tokens, get_vectorcore_num())
-
-    def _launch(cs_args: dict):
-        rd = cs_args["rope_dim"]
-        pass_dim = head_dim - rd
-        pad_pass_dim = triton.next_power_of_2(pass_dim) if pass_dim > 0 else 1
-        _triton_rope_fp8[(n_row,)](
-            q,
-            q.stride(0),
-            k,
-            k.stride(0),
-            q_out,
-            q_out.stride(0),
-            k_out,
-            k_out.stride(0),
-            cs_args["cos"],
-            cs_args["cos_stride"],
-            cs_args["sin"],
-            cs_args["sin_stride"],
-            cs_args["cos_sin"],
-            cs_args["cos_sin_stride"],
-            cs_args["pos"],
-            num_tokens,
-            n_q_head,
-            n_kv_head,
-            head_dim,
-            rd,
-            cs_args["pad_rope_dim"],
-            pad_pass_dim,
-            pass_dim,
-            BLOCK_SIZE_HEAD=block_size_head,
-            IS_NEOX_STYLE=is_neox_style,
-            USE_COS_SIN=cs_args["use_cos_sin"],
-            FP8_MAX=_FP8_E4M3_MAX,
+    if not is_neox_style:
+        raise NotImplementedError(
+            "rope_forward_triton_fp8 supports NeoX style only"
         )
-
-    if cos_sin_cache is not None and positions is not None:
-        assert positions.shape[0] == num_tokens
-        assert rope_dim <= head_dim
-        pad_rope_dim = triton.next_power_of_2(rope_dim)
-        _launch(
-            {
-                "cos": None,
-                "cos_stride": None,
-                "sin": None,
-                "sin_stride": None,
-                "cos_sin": cos_sin_cache,
-                "cos_sin_stride": cos_sin_cache.stride(0),
-                "pos": positions,
-                "rope_dim": rope_dim,
-                "pad_rope_dim": pad_rope_dim,
-                "use_cos_sin": True,
-            }
-        )
-    elif cos is not None and sin is not None:
-        assert cos.shape[0] == num_tokens and sin.shape[0] == num_tokens
-        cos = cos.view(num_tokens, -1)
-        sin = sin.view(num_tokens, -1)
-        if rope_dim == -1:
-            rope_dim = cos.shape[-1] * 2
-        assert rope_dim <= head_dim
-        pad_rope_dim = triton.next_power_of_2(rope_dim)
-        _launch(
-            {
-                "cos": cos,
-                "cos_stride": cos.stride(0),
-                "sin": sin,
-                "sin_stride": sin.stride(0),
-                "cos_sin": None,
-                "cos_sin_stride": None,
-                "pos": None,
-                "rope_dim": rope_dim,
-                "pad_rope_dim": pad_rope_dim,
-                "use_cos_sin": False,
-            }
-        )
-    else:
+    if cos_sin_cache is None or positions is None:
         raise ValueError(
-            "rope_forward_triton_fp8 requires either "
-            "(positions, cos_sin_cache) or (cos, sin)."
+            "rope_forward_triton_fp8 requires (positions, cos_sin_cache)"
         )
+
+    assert positions.shape[0] == num_tokens
+    assert rope_dim <= head_dim and rope_dim % 2 == 0
+    pass_dim = head_dim - rope_dim
+    pad_half = triton.next_power_of_2(rope_dim // 2)
+    pad_pass = triton.next_power_of_2(pass_dim) if pass_dim > 0 else 1
+    vc = get_vectorcore_num()
+    n_row = min(num_tokens, max(vc * 8, 256))
+    _triton_rope_fp8[(n_row,)](
+        q,
+        q.stride(0),
+        k,
+        k.stride(0),
+        q_out,
+        q_out.stride(0),
+        k_out,
+        k_out.stride(0),
+        cos_sin_cache,
+        cos_sin_cache.stride(0),
+        positions,
+        num_tokens,
+        n_q_head,
+        n_kv_head,
+        head_dim,
+        rope_dim,
+        pad_half,
+        pad_pass,
+        pass_dim,
+        BLOCK_QH=_fp8_rope_head_block(n_q_head),
+        BLOCK_KH=_fp8_rope_head_block(n_kv_head),
+        FP8_MAX=_FP8_E4M3_MAX,
+    )
     return q_out, k_out

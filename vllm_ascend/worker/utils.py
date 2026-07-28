@@ -105,8 +105,11 @@ class AscendKVBlockZeroer(KVBlockZeroer):
                 if layer_name in runner_only_attn_layers:
                     continue
                 kv_tuple = static_forward_context[layer_name].kv_cache
-                assert len(kv_tuple) == 2, "K and V are not stored separately"
-                for kv in kv_tuple:
+                assert len(kv_tuple) in (2, 3), "K and V must be stored separately, with an optional K-scale cache."
+                # The FP32 K-scale segment has a different block stride. Every
+                # live token overwrites its scale together with K/V, so only
+                # the equal-sized K/V segments participate in bulk zeroing.
+                for kv in kv_tuple[:2]:
                     block_dim = 0
                     dp = kv.data_ptr()
                     if dp in seen_ptrs:

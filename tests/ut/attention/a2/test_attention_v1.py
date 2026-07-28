@@ -96,6 +96,25 @@ class TestAscendAttentionBackend(TestBase):
         self.assertTrue(torch.all(kv_caches[0][1] == kv_caches[0][0]))
         self.assertTrue(torch.all(kv_caches[1][3] == kv_caches[1][2]))
 
+    def test_swap_blocks_copies_k_scale_cache(self):
+        src_kv_cache = [
+            torch.zeros((4, 2)),
+            torch.zeros((4, 2)),
+            torch.arange(8, dtype=torch.float32).view(4, 2),
+        ]
+        dst_kv_cache = [torch.zeros_like(cache) for cache in src_kv_cache]
+        AscendAttentionBackend.swap_blocks(
+            src_kv_cache,
+            dst_kv_cache,
+            torch.tensor([[2, 1]]),
+        )
+        self.assertTrue(
+            torch.equal(
+                dst_kv_cache[2][1],
+                src_kv_cache[2][2],
+            )
+        )
+
 
 class TestAscendAttentionMetadataBuilder(TestBase):
     def setUp(self):
@@ -287,6 +306,77 @@ class TestAscendAttentionBackendImpl(TestBase):
             attn_type=self.attention_type.DECODER,
             kv_sharing_target_layer_name=None,
         )
+
+    @patch(
+        "vllm_ascend.attention.attention_v1.scatter_pa_kv_cache_with_k_scale",
+    )
+    def test_scatter_minimax_m3_fp8_kv_cache(self, mock_scatter):
+        self.impl.key_cache = torch.empty(
+            (2, 8, 16, 64),
+            dtype=torch.float8_e4m3fn,
+        )
+        self.impl.value_cache = torch.empty_like(self.impl.key_cache)
+        self.impl.k_scale_cache = torch.empty(
+            (2, 8, 16, 1),
+            dtype=torch.float32,
+        )
+        key = torch.tensor([[[500.0] * 64] * 8], dtype=torch.float32)
+        value = torch.tensor([[[-500.0] * 64] * 8], dtype=torch.float32)
+        slot_mapping = torch.tensor([3], dtype=torch.int32)
+
+        self.impl._scatter_fp8_kv_cache(key, value, slot_mapping)
+
+        args = mock_scatter.call_args.args
+        self.assertEqual(args[0].dtype, torch.float8_e4m3fn)
+        self.assertEqual(args[1].dtype, torch.float8_e4m3fn)
+        self.assertTrue(torch.all(args[0].float() == 448.0))
+        self.assertTrue(torch.all(args[1].float() == -448.0))
+        self.assertEqual(args[5].shape, (1, 8))
+        self.assertEqual(args[5].dtype, torch.float32)
+        self.assertTrue(torch.all(args[5] == 1.0))
+        self.assertIs(args[6], self.impl.k_scale_cache)
+
+    @patch("vllm_ascend.attention.attention_v1.torch_npu.npu_fused_infer_attention_score_v2")
+    def test_fia_minimax_m3_fp8_reads_k_scale_cache(self, mock_fia):
+        self.impl.key_cache = torch.empty(
+            (2, 8, 16, 64),
+            dtype=torch.float8_e4m3fn,
+        )
+        self.impl.value_cache = torch.empty_like(self.impl.key_cache)
+        self.impl.k_scale_cache = torch.ones(
+            (2, 8, 16, 1),
+            dtype=torch.float32,
+        )
+        mock_fia.return_value = (
+            torch.zeros((2, 8, 64), dtype=torch.bfloat16),
+            None,
+        )
+        metadata = SimpleNamespace(
+            actual_seq_lengths_q=[2],
+            seq_lens_list=[2],
+            block_tables=torch.tensor([[0]], dtype=torch.int32),
+            attn_state=AscendAttentionState.PrefillNoCache,
+            attn_mask=None,
+        )
+        output = torch.empty((2, 8, 64), dtype=torch.bfloat16)
+
+        self.impl._forward_fia_fp8(
+            torch.zeros((2, 8, 64), dtype=torch.bfloat16),
+            metadata,
+            output,
+        )
+
+        args = mock_fia.call_args.args
+        kwargs = mock_fia.call_args.kwargs
+        self.assertEqual(args[0].shape, (8, 2, 64))
+        self.assertEqual(args[0].dtype, torch.float8_e4m3fn)
+        self.assertIs(args[1], self.impl.key_cache)
+        self.assertIs(args[2], self.impl.value_cache)
+        self.assertEqual(kwargs["dequant_scale_query"].shape, (8, 2))
+        self.assertEqual(kwargs["dequant_scale_key"].shape, (2, 8, 16))
+        self.assertEqual(kwargs["dequant_scale_value"].shape, (8,))
+        self.assertEqual(kwargs["input_layout"], "NTD_TND")
+        self.assertEqual(kwargs["out_dtype"], torch.bfloat16)
 
     @patch("vllm_ascend.ascend_forward_context.get_forward_context")
     def test_large_head_prefill_uses_device_operator_fallback(self, mock_get_forward_context):

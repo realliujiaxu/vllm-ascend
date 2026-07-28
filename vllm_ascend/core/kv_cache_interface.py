@@ -8,7 +8,10 @@ from typing_extensions import Self
 from vllm.config import VllmConfig
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import get_dtype_size
-from vllm.v1.core.single_type_kv_cache_manager import SlidingWindowManager
+from vllm.v1.core.single_type_kv_cache_manager import (
+    FullAttentionManager,
+    SlidingWindowManager,
+)
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MLAAttentionSpec, SlidingWindowMLASpec
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 
@@ -22,6 +25,29 @@ def _get_c8_k_cache_dtype() -> torch.dtype:
 
 def _get_c8_k_scale_cache_dtype() -> torch.dtype:
     return torch.float32 if get_ascend_device_type() == AscendDeviceType.A5 else torch.float16
+
+
+@dataclass(frozen=True, kw_only=True)
+class AscendGQAFp8AttentionSpec(FullAttentionSpec):
+    """FP8 K/V cache with a per-token, per-head FP32 K scale cache."""
+
+    k_scale_dtype: torch.dtype = torch.float32
+
+    @property
+    def k_page_size_bytes(self) -> int:
+        return self.block_size * self.num_kv_heads * self.head_size * get_dtype_size(self.dtype)
+
+    @property
+    def v_page_size_bytes(self) -> int:
+        return self.block_size * self.num_kv_heads * self.head_size_v * get_dtype_size(self.dtype)
+
+    @property
+    def k_scale_page_size_bytes(self) -> int:
+        return self.block_size * self.num_kv_heads * get_dtype_size(self.k_scale_dtype)
+
+    @property
+    def real_page_size_bytes(self) -> int:
+        return self.k_page_size_bytes + self.v_page_size_bytes + self.k_scale_page_size_bytes
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -262,6 +288,11 @@ class AscendSlidingWindowMLASpec(SlidingWindowMLASpec):
 
 
 def register_ascend_kv_cache_specs() -> None:
+    KVCacheSpecRegistry.register(
+        kvcache_spec_cls=AscendGQAFp8AttentionSpec,
+        manager_class=FullAttentionManager,
+        uniform_type_base_spec=FullAttentionSpec,
+    )
     KVCacheSpecRegistry.register(
         kvcache_spec_cls=AscendMLAAttentionSpec,
         manager_class=CompressAttentionManager,

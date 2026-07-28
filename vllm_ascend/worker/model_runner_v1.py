@@ -64,6 +64,7 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     EncoderOnlyAttentionSpec,
+    FullAttentionSpec,
     HiddenStateCacheSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
@@ -191,7 +192,11 @@ else:
 
 from vllm.model_executor.layers.attention import Attention, MLAAttention
 
-from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, AscendSlidingWindowMLASpec
+from vllm_ascend.core.kv_cache_interface import (
+    AscendGQAFp8AttentionSpec,
+    AscendMLAAttentionSpec,
+    AscendSlidingWindowMLASpec,
+)
 
 # if true, allow tensor initialization and casting with internal format (e.g., NZ)
 torch.npu.config.allow_internal_format = True
@@ -4162,6 +4167,34 @@ class NPUModelRunner(GPUModelRunner):
                     current_kv_cache_spec = layer_kv_cache_spec[layer_name]
                     assert isinstance(current_kv_cache_spec, AttentionSpec)
 
+                    if isinstance(current_kv_cache_spec, AscendGQAFp8AttentionSpec):
+                        assert current_kv_cache_spec.page_size_padded is None, (
+                            "MiniMax M3 dense FP8 KV cache does not support padded pages."
+                        )
+                        assert kv_cache_tensor.size % current_kv_cache_spec.page_size_bytes == 0
+                        num_blocks = kv_cache_tensor.size // current_kv_cache_spec.page_size_bytes
+                        k_tensor = self._allocate_int8_cache_tensor(
+                            current_kv_cache_spec.k_page_size_bytes * num_blocks,
+                            alignment,
+                        )
+                        v_tensor = self._allocate_int8_cache_tensor(
+                            current_kv_cache_spec.v_page_size_bytes * num_blocks,
+                            alignment,
+                        )
+                        k_scale_tensor = self._allocate_int8_cache_tensor(
+                            current_kv_cache_spec.k_scale_page_size_bytes * num_blocks,
+                            alignment,
+                        )
+                        for layer_name_inner in kv_cache_tensor.shared_by:
+                            inner_spec = layer_kv_cache_spec[layer_name_inner]
+                            assert isinstance(inner_spec, AscendGQAFp8AttentionSpec)
+                            kv_cache_raw_tensors[layer_name_inner] = (
+                                k_tensor,
+                                v_tensor,
+                                k_scale_tensor,
+                            )
+                        continue
+
                     if self.use_sparse:
                         # for deepseek v3.2, we split the kv cache according to the corresponding ratio
                         kv_cache_spec = layer_kv_cache_spec[layer_name]
@@ -4399,6 +4432,44 @@ class NPUModelRunner(GPUModelRunner):
 
                     kv_caches[layer_name] = kv_cache
                 elif isinstance(current_kv_cache_spec, AttentionSpec):
+                    if isinstance(current_kv_cache_spec, AscendGQAFp8AttentionSpec):
+                        raw_k_tensor, raw_v_tensor, raw_k_scale_tensor = kv_cache_raw_tensors[layer_name]  # type: ignore
+                        total_bytes = (
+                            raw_k_tensor.numel()
+                            + raw_v_tensor.numel()
+                            + raw_k_scale_tensor.numel()
+                        )
+                        assert total_bytes % current_kv_cache_spec.page_size_bytes == 0
+                        num_blocks = total_bytes // current_kv_cache_spec.page_size_bytes
+                        assert num_blocks >= kv_cache_config.num_blocks
+
+                        k_shape = (
+                            num_blocks,
+                            current_kv_cache_spec.num_kv_heads,
+                            current_kv_cache_spec.block_size,
+                            current_kv_cache_spec.head_size,
+                        )
+                        v_shape = (
+                            num_blocks,
+                            current_kv_cache_spec.num_kv_heads,
+                            current_kv_cache_spec.block_size,
+                            current_kv_cache_spec.head_size_v,
+                        )
+                        k_scale_shape = (
+                            num_blocks,
+                            current_kv_cache_spec.num_kv_heads,
+                            current_kv_cache_spec.block_size,
+                            1,
+                        )
+                        k_cache = raw_k_tensor.view(current_kv_cache_spec.dtype).view(k_shape)
+                        v_cache = raw_v_tensor.view(current_kv_cache_spec.dtype).view(v_shape)
+                        k_scale_cache = raw_k_scale_tensor.view(
+                            current_kv_cache_spec.k_scale_dtype
+                        ).view(k_scale_shape)
+                        k_scale_cache.fill_(1.0)
+                        kv_caches[layer_name] = (k_cache, v_cache, k_scale_cache)
+                        continue
+
                     # cache_only_layers (extract_hidden_states) are allocated
                     # as a single tensor by the branch at the top of
                     # _allocate_kv_cache_tensors; route them to the dedicated
@@ -4891,6 +4962,23 @@ class NPUModelRunner(GPUModelRunner):
                 (Attention, MiniMaxM3SparseAttention, AscendMiniMaxM3IndexerCache),
             ):
                 if spec := attn_module.get_kv_cache_spec(self.vllm_config):
+                    if (
+                        isinstance(attn_module, Attention)
+                        and getattr(attn_module, "_ascend_minimax_m3_dense_gqa", False)
+                        and str(self.vllm_config.cache_config.cache_dtype) in ("fp8", "fp8_e4m3")
+                    ):
+                        assert isinstance(spec, FullAttentionSpec)
+                        spec = AscendGQAFp8AttentionSpec(
+                            block_size=spec.block_size,
+                            num_kv_heads=spec.num_kv_heads,
+                            head_size=spec.head_size,
+                            head_size_v=spec.head_size_v,
+                            dtype=torch.float8_e4m3fn,
+                            kv_quant_mode=spec.kv_quant_mode,
+                            page_size_padded=spec.page_size_padded,
+                            sliding_window=spec.sliding_window,
+                            attention_chunk_size=spec.attention_chunk_size,
+                        )
                     kv_cache_spec[layer_name] = spec
                     attn_layer_names.add(layer_name)
 

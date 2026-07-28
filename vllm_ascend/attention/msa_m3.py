@@ -73,6 +73,23 @@ _SPARSE_ATTN_NEW_OP_PP_SIZE = 8
 _SPARSE_ATTN_LOGGED = False
 
 
+
+def _resolve_indexer_kv_dtype(vllm_config: VllmConfig) -> str:
+    """Resolve indexer cache dtype without requiring upstream AttentionConfig field.
+
+    Priority:
+      1. ``attention_config.indexer_kv_dtype`` (newer vLLM)
+      2. ``additional_config["indexer_kv_dtype"]`` (Ascend-only, no vLLM change)
+      3. default ``"bf16"``
+    """
+    attn = getattr(vllm_config, "attention_config", None)
+    dtype = getattr(attn, "indexer_kv_dtype", None) if attn is not None else None
+    if dtype is None:
+        additional = getattr(vllm_config, "additional_config", None) or {}
+        dtype = additional.get("indexer_kv_dtype", "bf16")
+    return str(dtype)
+
+
 def _scatter_index_cache(
     cache: torch.Tensor,
     updates: torch.Tensor,
@@ -1177,7 +1194,7 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
 
         vllm_config = get_current_vllm_config()
         self.layer_name = f"{prefix}.attn"
-        self.indexer_kv_dtype = vllm_config.attention_config.indexer_kv_dtype
+        self.indexer_kv_dtype = _resolve_indexer_kv_dtype(vllm_config)
         self.kv_cache_dtype = (
             cache_config.cache_dtype if cache_config is not None else "auto"
         )

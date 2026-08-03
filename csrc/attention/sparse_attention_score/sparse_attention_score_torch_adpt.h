@@ -17,7 +17,8 @@ at::Tensor npu_sparse_attention_score(
     const c10::optional<at::Tensor> &actual_seq_lengths_kv,
     const c10::optional<at::Tensor> &q_dequant_scale,
     const c10::optional<at::Tensor> &k_dequant_scale,
-    const c10::optional<at::Tensor> &v_dequant_scale
+    const c10::optional<at::Tensor> &v_dequant_scale,
+    const c10::optional<at::ScalarType> &attention_out_dtype
     )
 {
 
@@ -26,7 +27,18 @@ at::Tensor npu_sparse_attention_score(
                                        "than 0, but shape[", i, "] is ", query.size(i));
     }
 
-    at::Tensor output = at::empty(query.sizes(), query.options().dtype(query.dtype()));
+    // FP8 defaults to bf16 output when caller omits attention_out_dtype.
+    c10::optional<at::ScalarType> resolved_out_dtype = attention_out_dtype;
+    if (query.scalar_type() == at::kFloat8_e4m3fn && !resolved_out_dtype.has_value()) {
+        resolved_out_dtype = at::kBFloat16;
+    }
+
+    at::ScalarType out_dtype = query.scalar_type();
+    if (query.scalar_type() == at::kFloat8_e4m3fn) {
+        out_dtype = resolved_out_dtype.value();
+    }
+
+    at::Tensor output = at::empty(query.sizes(), query.options().dtype(out_dtype));
     at::Tensor softmax_lse;
 
     EXEC_NPU_CMD(

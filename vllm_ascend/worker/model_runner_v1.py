@@ -69,6 +69,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheSpec,
+    KVQuantMode,
     MambaSpec,
     UniformTypeKVCacheSpecs,
 )
@@ -4968,17 +4969,39 @@ class NPUModelRunner(GPUModelRunner):
                         and str(self.vllm_config.cache_config.cache_dtype) in ("fp8", "fp8_e4m3")
                     ):
                         assert isinstance(spec, FullAttentionSpec)
-                        spec = AscendGQAFp8AttentionSpec(
-                            block_size=spec.block_size,
-                            num_kv_heads=spec.num_kv_heads,
-                            head_size=spec.head_size,
-                            head_size_v=spec.head_size_v,
-                            dtype=torch.float8_e4m3fn,
-                            kv_quant_mode=spec.kv_quant_mode,
-                            page_size_padded=spec.page_size_padded,
-                            sliding_window=spec.sliding_window,
-                            attention_chunk_size=spec.attention_chunk_size,
-                        )
+                        if self.ascend_config.enable_gqa_kv_cache_fp8:
+                            spec = AscendGQAFp8AttentionSpec(
+                                block_size=spec.block_size,
+                                num_kv_heads=spec.num_kv_heads,
+                                head_size=spec.head_size,
+                                head_size_v=spec.head_size_v,
+                                dtype=torch.float8_e4m3fn,
+                                kv_quant_mode=spec.kv_quant_mode,
+                                page_size_padded=spec.page_size_padded,
+                                sliding_window=spec.sliding_window,
+                                attention_chunk_size=spec.attention_chunk_size,
+                            )
+                        else:
+                            # Keep the global FP8 cache dtype available for MSA,
+                            # while dense GQA uses the model's native dtype.
+                            attn_module.kv_cache_dtype = "auto"
+                            attn_module.kv_cache_torch_dtype = self.dtype
+                            attn_module.calculate_kv_scales = False
+                            attn_module.query_quant = None
+                            attn_module.impl.kv_cache_dtype = "auto"
+                            spec = replace(
+                                spec,
+                                dtype=self.dtype,
+                                kv_quant_mode=KVQuantMode.NONE,
+                                page_size_padded=None,
+                            )
+                    elif (
+                        isinstance(attn_module, MiniMaxM3SparseAttention)
+                        and str(self.vllm_config.cache_config.cache_dtype)
+                        in ("fp8", "fp8_e4m3")
+                    ):
+                        assert isinstance(spec, FullAttentionSpec)
+                        spec = replace(spec, dtype=torch.float8_e4m3fn)
                     kv_cache_spec[layer_name] = spec
                     attn_layer_names.add(layer_name)
 

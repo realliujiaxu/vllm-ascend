@@ -61,6 +61,7 @@ class TestAscendConfig(TestBase):
         ascend_config = init_ascend_config(test_vllm_config)
         self.assertFalse(ascend_config.multistream_overlap_shared_expert)
         self.assertFalse(ascend_config.enable_kv_nz)
+        self.assertFalse(ascend_config.enable_gqa_kv_cache_fp8)
 
         ascend_compilation_config = ascend_config.ascend_compilation_config
         self.assertTrue(ascend_compilation_config.fuse_norm_quant)
@@ -83,6 +84,7 @@ class TestAscendConfig(TestBase):
             "eplb_config": {"num_redundant_experts": 2},
             "refresh": True,
             "enable_kv_nz": False,
+            "enable_gqa_kv_cache_fp8": True,
         }
         ascend_config = init_ascend_config(test_vllm_config)
         self.assertEqual(ascend_config.eplb_config.num_redundant_experts, 2)
@@ -91,11 +93,26 @@ class TestAscendConfig(TestBase):
         ascend_compilation_config = ascend_config.ascend_compilation_config
         self.assertFalse(ascend_compilation_config.fuse_norm_quant)
         self.assertFalse(ascend_config.enable_kv_nz)
+        self.assertTrue(ascend_config.enable_gqa_kv_cache_fp8)
         self.assertTrue(ascend_compilation_config.enable_npugraph_ex)
         self.assertFalse(ascend_compilation_config.enable_static_kernel)
 
         ascend_fusion_config = ascend_config.ascend_fusion_config
         self.assertFalse(ascend_fusion_config.fusion_ops_gmmswigluquant)
+
+    @_clean_up_ascend_config
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_init_ascend_config_rejects_non_boolean_gqa_kv_cache_fp8(
+        self,
+        mock_fix_incompatible_config,
+    ):
+        test_vllm_config = VllmConfig()
+        test_vllm_config.additional_config = {
+            "enable_gqa_kv_cache_fp8": "true",
+        }
+
+        with self.assertRaisesRegex(TypeError, "enable_gqa_kv_cache_fp8 must be a boolean"):
+            init_ascend_config(test_vllm_config)
 
     @_clean_up_ascend_config
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")

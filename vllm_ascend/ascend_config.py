@@ -273,6 +273,13 @@ class AscendConfig:
                     "enable_kv_nz is only supported in pd scenario and can only be used in D node."
                 )
 
+        self.enable_gqa_kv_cache_fp8 = additional_config.get("enable_gqa_kv_cache_fp8", False)
+        if not isinstance(self.enable_gqa_kv_cache_fp8, bool):
+            raise TypeError(
+                "enable_gqa_kv_cache_fp8 must be a boolean, "
+                f"got {type(self.enable_gqa_kv_cache_fp8).__name__}"
+            )
+
         self.enable_sparse_c8 = additional_config.get("enable_sparse_c8", False) and use_sparse
         self.c8_enable_reshape_optim = self.enable_sparse_c8 and additional_config.get("c8_enable_reshape_optim", False)
         quant_config = getattr(vllm_config, "quant_config", None)

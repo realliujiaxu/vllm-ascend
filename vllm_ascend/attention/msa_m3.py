@@ -71,6 +71,7 @@ logger = init_logger(__name__)
 _SPARSE_ATTN_NEW_OP_PP_SIZE = 8
 
 _SPARSE_ATTN_LOGGED = False
+FP8_E4M3_MAX = 448.0
 
 
 
@@ -1198,7 +1199,7 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         self.kv_cache_dtype = (
             cache_config.cache_dtype if cache_config is not None else "auto"
         )
-        self.kv_cache_dtype = "bfloat16"
+        # self.kv_cache_dtype = "bfloat16"
         self.kv_cache_torch_dtype = kv_cache_dtype_str_to_dtype(
             self.kv_cache_dtype, vllm_config.model_config
         )
@@ -1271,15 +1272,21 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         assert isinstance(main_meta, AscendMiniMaxM3SparseMetadata)
         assert isinstance(index_meta, AscendMiniMaxM3IndexerMetadata)
 
-        from vllm_ascend.device.device_op import DeviceOperator
-
-        key_cache, value_cache = self.kv_cache
+        key_cache, value_cache = self.kv_cache[0], self.kv_cache[1]
         num_tokens = main_meta.num_actual_tokens
         k_insert = key[:num_tokens].view(-1, self.num_kv_heads, self.head_dim)
         v_insert = value[:num_tokens].view(-1, self.num_kv_heads, self.head_dim)
+        k_fp8 = k_insert.clamp(min=-FP8_E4M3_MAX, max=FP8_E4M3_MAX).to(
+            torch.float8_e4m3fn
+        )
+        v_fp8 = v_insert.clamp(min=-FP8_E4M3_MAX, max=FP8_E4M3_MAX).to(
+            torch.float8_e4m3fn
+        )
+        from vllm_ascend.device.device_op import DeviceOperator
+
         DeviceOperator.reshape_and_cache(
-            k_insert,
-            v_insert,
+            k_fp8,
+            v_fp8,
             key_cache,
             value_cache,
             main_meta.slot_mapping[:num_tokens],

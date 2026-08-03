@@ -356,7 +356,8 @@ at::Tensor npu_sparse_attention_score_meta(
     const c10::optional<at::Tensor> &actual_seq_lengths_kv,
     const c10::optional<at::Tensor> &q_dequant_scale,
     const c10::optional<at::Tensor> &k_dequant_scale,
-    const c10::optional<at::Tensor> &v_dequant_scale
+    const c10::optional<at::Tensor> &v_dequant_scale,
+    const c10::optional<at::ScalarType> &attention_out_dtype
     )
 {
 
@@ -364,8 +365,13 @@ at::Tensor npu_sparse_attention_score_meta(
         TORCH_CHECK(query.size(i) > 0, "All values within query's shape should be greater "
                                        "than 0, but shape[", i, "] is ", query.size(i));
     }
-    at::Tensor output = at::empty(query.sizes(), query.options().dtype(query.dtype()));
-    return output;
+    at::ScalarType out_dtype = query.scalar_type();
+    if (query.scalar_type() == at::kFloat8_e4m3fn) {
+        out_dtype = attention_out_dtype.value_or(at::kBFloat16);
+        TORCH_CHECK(out_dtype == at::kHalf || out_dtype == at::kBFloat16,
+                    "attention_out_dtype must be float16 or bfloat16 for float8_e4m3fn input.");
+    }
+    return at::empty(query.sizes(), query.options().dtype(out_dtype));
 }
 
 std::tuple<at::Tensor, at::Tensor> matmul_allreduce_add_rmsnorm_meta(

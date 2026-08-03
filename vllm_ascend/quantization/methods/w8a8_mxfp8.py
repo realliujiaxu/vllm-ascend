@@ -301,8 +301,16 @@ class AscendW8A8MXFP8DynamicFusedMoEMethod(AscendMoEScheme):
         # this is a naive implementation for experts load balance so as
         # to avoid accumulating too much tokens on a single rank.
         # currently it is only activated when doing profile runs.
+        # enable_force_load_balance = True
         if enable_force_load_balance:
-            random_matrix = torch.rand(topk_ids.size(0), num_logical_experts, device=topk_ids.device)
+            #random_matrix = torch.rand(topk_ids.size(0), num_logical_experts, device=topk_ids.device)
+            random_matrix = torch.randint(
+                low=0, 
+                high=1000000, # 范围足够大即可，防止出现重复值
+                size=(topk_ids.size(0), num_logical_experts), 
+                device=topk_ids.device,
+                dtype=torch.float32 # 指定为 float32 确保后续 argsort 兼容性最好
+            )
             topk_ids = torch.argsort(random_matrix, dim=1)[:, : topk_ids.size(1)].to(topk_ids.dtype)
 
         if x.dtype not in [torch.float8_e4m3fn]:

@@ -1319,7 +1319,8 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         index_k = qkv.narrow(-1, main_qkv_size + self.index_q_size, self.idx_head_dim)
 
         if (
-            main_qkv.device.type != "npu"
+            True
+            or main_qkv.device.type != "npu"
             or main_qkv.dtype != torch.bfloat16
             or positions.ndim != 1
             or not getattr(self.rotary_emb, "is_neox_style", True)
@@ -1329,6 +1330,9 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             )
             q, k = self._qk_norm(q, k)
             q, k = self.rotary_emb(positions, q, k)
+            q = q.contiguous()
+            k = k.contiguous()
+            v = v.contiguous()
         else:
             q, k, v = torch.ops.vllm.qkv_rmsnorm_rope(
                 input=main_qkv.contiguous(),

@@ -487,7 +487,8 @@ class MiniMaxM3Attention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         if (
-            qkv.device.type != "npu"
+            True
+            or qkv.device.type != "npu"
             or qkv.dtype != torch.bfloat16
             or positions.ndim != 1
             or not getattr(self.rotary_emb, "is_neox_style", True)
@@ -495,6 +496,9 @@ class MiniMaxM3Attention(nn.Module):
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
             q, k = self._qk_norm(q, k)
             q, k = self.rotary_emb(positions, q, k)
+            q = q.contiguous()
+            k = k.contiguous()
+            v = v.contiguous()
         else:
             q_weight = getattr(self.q_norm, "weight_plus_one", None)
             k_weight = getattr(self.k_norm, "weight_plus_one", None)

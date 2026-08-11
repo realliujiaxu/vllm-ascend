@@ -242,7 +242,14 @@ def _index_block_score_kernel(
     bt_row = block_table_ptr + pid_b * stride_bt_b
     hi = tl.minimum(seq_len, prefix_len + (pid_q + 1) * BLOCK_SIZE_Q)
 
-    middle = (q_start - BLOCK_SIZE_K) // BLOCK_SIZE_K * BLOCK_SIZE_K
+    # The first query tile can start at position 0. Without the clamp this
+    # evaluates to -BLOCK_SIZE_K, making the loop below read block_table[-1]
+    # and write score[..., -1]. Multi-request block tables make that invalid
+    # access particularly likely to surface as an NPU MTE out-of-range error.
+    middle = tl.maximum(
+        0,
+        (q_start - BLOCK_SIZE_K) // BLOCK_SIZE_K * BLOCK_SIZE_K,
+    )
 
     for key_start in tl.range(0, middle, BLOCK_SIZE_K):
         block_id = key_start // BLOCK_SIZE_K

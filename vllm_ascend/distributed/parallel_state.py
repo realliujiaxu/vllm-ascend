@@ -24,7 +24,28 @@ _SHARD_WEIGHT: GroupCoordinator | None = None
 
 _P_TP: GroupCoordinator | None = None
 
+# Ranks that carry the same replicated KV/index head when TP is larger than
+# the model's KV-head count.  MiniMax-M3 uses this group as a local context-
+# parallel group for its replicated sparse indexer.
+_KV_HEAD_REPLICA: GroupCoordinator | None = None
+
 _DYNAMIC_EPLB: GroupCoordinator | None = None
+
+
+def _get_kv_head_replica_group_ranks(
+    all_ranks: torch.Tensor,
+    tensor_parallel_size: int,
+    total_num_kv_heads: int,
+) -> list[list[int]]:
+    """Build adjacent TP subgroups that own the same replicated KV head."""
+    if total_num_kv_heads <= 0 or tensor_parallel_size <= total_num_kv_heads:
+        return []
+    if tensor_parallel_size % total_num_kv_heads != 0:
+        return []
+
+    replica_size = tensor_parallel_size // total_num_kv_heads
+    tp_groups = all_ranks.reshape(-1, tensor_parallel_size)
+    return tp_groups.reshape(-1, total_num_kv_heads, replica_size).reshape(-1, replica_size).tolist()
 
 
 def init_ascend_model_parallel(
@@ -50,6 +71,27 @@ def init_ascend_model_parallel(
         global_pcp_size,
         global_tp_size,
     )
+
+    # vLLM replicates KV heads on adjacent TP ranks when TP is larger than the
+    # KV-head count.  Create the corresponding subgroups once at distributed
+    # initialization so model-specific attention paths can reuse them without
+    # creating process groups during model construction or graph capture.
+    global _KV_HEAD_REPLICA
+    model_config = get_current_vllm_config().model_config
+    total_num_kv_heads = model_config.get_total_num_kv_heads()
+    if isinstance(total_num_kv_heads, int):
+        replica_group_ranks = _get_kv_head_replica_group_ranks(
+            all_ranks,
+            global_tp_size,
+            total_num_kv_heads,
+        )
+        if replica_group_ranks:
+            _KV_HEAD_REPLICA = init_model_parallel_group(
+                replica_group_ranks,
+                get_world_group().local_rank,
+                backend,
+                group_name="kv_head_replica",
+            )
 
     pd_tp_ratio = get_ascend_config().pd_tp_ratio
     pd_head_ratio = get_ascend_config().pd_head_ratio
@@ -274,6 +316,11 @@ def get_p_tp_group() -> GroupCoordinator:
     return _P_TP
 
 
+def get_kv_head_replica_group() -> GroupCoordinator:
+    assert _KV_HEAD_REPLICA is not None, "KV-head replica group is not initialized"
+    return _KV_HEAD_REPLICA
+
+
 def get_fc3_quant_x_group() -> GroupCoordinator:
     assert _FC3_QUANT_X is not None, "fc3 quant x group is not initialized"
     return _FC3_QUANT_X
@@ -314,6 +361,11 @@ def destroy_ascend_model_parallel():
     if _P_TP:
         _P_TP.destroy()
     _P_TP = None
+
+    global _KV_HEAD_REPLICA
+    if _KV_HEAD_REPLICA:
+        _KV_HEAD_REPLICA.destroy()
+    _KV_HEAD_REPLICA = None
 
     global _FLASHCOMM2_OTP
     if _FLASHCOMM2_OTP and get_ascend_config().flashcomm2_oproj_tensor_parallel_size != 1:

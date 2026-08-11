@@ -2,6 +2,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+import torch
 from vllm.config import ParallelConfig
 
 from vllm_ascend.distributed.parallel_state import (
@@ -11,12 +12,14 @@ from vllm_ascend.distributed.parallel_state import (
     _MC2,
     _OTP,
     _P_TP,
+    _get_kv_head_replica_group_ranks,
     destroy_ascend_model_parallel,
     get_flashcomm2_odp_group,
     get_flashcomm2_otp_group,
     get_global_rank,
     get_lmhead_tp_group,
     get_mc2_group,
+    get_kv_head_replica_group,
     get_otp_group,
     get_p_tp_group,
     init_ascend_model_parallel,
@@ -61,6 +64,7 @@ def test_init_ascend_model_parallel(mock_distributed, parallel_config):
     mock_ascend_config.enable_context_parallel = False
     mock_vllm_config = MagicMock()
     mock_vllm_config.kv_transfer_config.is_kv_producer = True
+    mock_vllm_config.model_config.get_total_num_kv_heads.return_value = 2
     with (
         patch("vllm_ascend.distributed.parallel_state.model_parallel_initialized", return_value=False),
         patch("vllm_ascend.distributed.parallel_state.init_model_parallel_group"),
@@ -76,12 +80,14 @@ def test_init_ascend_model_parallel(mock_distributed, parallel_config):
         flashcomm2_otp_group = get_flashcomm2_otp_group()
         flashcomm2_odp_group = get_flashcomm2_odp_group()
         p_tp_group = get_p_tp_group()
+        kv_head_replica_group = get_kv_head_replica_group()
         assert mc2_group is not None
         assert otp_group is not None
         assert flashcomm2_otp_group is not None
         assert flashcomm2_odp_group is not None
         assert lmheadtp_group is not None
         assert p_tp_group is not None
+        assert kv_head_replica_group is not None
 
         destroy_ascend_model_parallel()
         assert _MC2 is None
@@ -90,6 +96,23 @@ def test_init_ascend_model_parallel(mock_distributed, parallel_config):
         assert _FLASHCOMM2_OTP is None
         assert _FLASHCOMM2_ODP is None
         assert _P_TP is None
+
+
+def test_get_kv_head_replica_group_ranks():
+    all_ranks = torch.arange(16).reshape(2, 1, 1, 1, 8)
+
+    assert _get_kv_head_replica_group_ranks(all_ranks, 8, 4) == [
+        [0, 1],
+        [2, 3],
+        [4, 5],
+        [6, 7],
+        [8, 9],
+        [10, 11],
+        [12, 13],
+        [14, 15],
+    ]
+    assert _get_kv_head_replica_group_ranks(all_ranks, 8, 8) == []
+    assert _get_kv_head_replica_group_ranks(all_ranks, 8, 3) == []
 
 
 def _build_parallel_config(

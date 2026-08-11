@@ -1,5 +1,6 @@
 import torch
 
+from vllm_ascend.attention.msa_m3 import _build_local_cp_query_tile_layout
 from vllm_ascend.attention.msa_m3_triton import (
      minimax_m3_index_score,
      minimax_m3_index_topk,
@@ -304,7 +305,114 @@ def test_prefill_index_topk_correctness():
     )
 
 
+def test_prefill_index_topk_local_cp_correctness():
+    """Two local-CP ranks must reconstruct a zero-prefix multi-request result.
+
+    In particular, rank 0 owns the first query tile of each request.  Its
+    local prefix is zero, which used to make the score kernel start from
+    ``block_table[-1]``.
+    """
+    cfg = dict(
+        q_lens=(425, 425),
+        prefix_lens=(0, 0),
+        init_blocks=1,
+        local_blocks=1,
+        topk=8,
+        num_idx_heads=4,
+        head_dim=128,
+        dtype=torch.bfloat16,
+        randomize=False,
+    )
+    inp = _build_inputs(
+        q_lens=cfg["q_lens"],
+        prefix_lens=cfg["prefix_lens"],
+        num_idx_heads=cfg["num_idx_heads"],
+        head_dim=cfg["head_dim"],
+        dtype=cfg["dtype"],
+        randomize=cfg["randomize"],
+    )
+
+    partial_topk = []
+    for local_cp_rank in range(2):
+        (
+            query_indices_cpu,
+            request_indices_cpu,
+            request_offsets_cpu,
+            local_cu_seqlens_cpu,
+            local_max_query_len,
+        ) = _build_local_cp_query_tile_layout(
+            inp["q_lens"].cpu(),
+            local_cp_size=2,
+            local_cp_rank=local_cp_rank,
+        )
+        query_indices = query_indices_cpu.npu()
+        request_indices = request_indices_cpu.npu()
+        request_offsets = request_offsets_cpu.npu()
+        local_cu_seqlens = local_cu_seqlens_cpu.npu()
+        local_iq = torch.index_select(inp["idx_q"], 0, query_indices)
+        local_seq_lens = torch.index_select(
+            inp["seq_lens"],
+            0,
+            request_indices,
+        )
+        local_prefix_lens = torch.index_select(
+            inp["prefix_lens"],
+            0,
+            request_indices,
+        ) + request_offsets
+        local_block_table = torch.index_select(
+            inp["block_table"],
+            0,
+            request_indices,
+        )
+        score = minimax_m3_index_score(
+            local_iq,
+            inp["index_kv_cache"],
+            local_block_table,
+            local_cu_seqlens,
+            local_seq_lens,
+            local_prefix_lens,
+            max_query_len=local_max_query_len,
+            max_seq_len=inp["max_seq_len"],
+            num_kv_heads=cfg["num_idx_heads"],
+            sm_scale=inp["sm_scale"],
+        )
+        local_topk = minimax_m3_index_topk(
+            score,
+            local_cu_seqlens,
+            local_prefix_lens,
+            max_query_len=local_max_query_len,
+            topk=cfg["topk"],
+            init_blocks=cfg["init_blocks"],
+            local_blocks=cfg["local_blocks"],
+        )
+        rank_topk = torch.full(
+            (cfg["num_idx_heads"], inp["idx_q"].shape[0], cfg["topk"]),
+            -1,
+            dtype=torch.int32,
+            device=DEVICE,
+        )
+        rank_topk.index_copy_(1, query_indices, local_topk)
+        partial_topk.append(rank_topk)
+
+    actual = torch.maximum(partial_topk[0], partial_topk[1])
+    expected = _reference_index_topk(
+        inp["idx_q"].float().cpu(),
+        inp["index_kv_cache"].float().cpu(),
+        inp["block_table"].cpu(),
+        inp["q_lens"].cpu(),
+        inp["seq_lens"].cpu(),
+        inp["prefix_lens"].cpu(),
+        cfg["topk"],
+        cfg["init_blocks"],
+        cfg["local_blocks"],
+        inp["sm_scale"],
+    ).to(DEVICE)
+    assert _compare_topk(actual, expected)["match"]
+
+
 if __name__ == "__main__":
     assert hasattr(torch, "npu") and torch.npu.is_available(), "NPU is not available"
     torch.manual_seed(0)
     test_prefill_index_topk_correctness()
+    test_prefill_index_topk_local_cp_correctness()

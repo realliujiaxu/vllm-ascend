@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any, ClassVar
 
 import torch
+import torch.distributed as dist
 import torch_npu
 from torch import nn
 from torch.nn.parameter import Parameter
@@ -61,6 +62,7 @@ from vllm_ascend.attention.msa_m3_ops import (
     minimax_m3_sparse_attn_torch as minimax_m3_sparse_attn,
     minimax_m3_sparse_attn_decode_torch as minimax_m3_sparse_attn_decode,
 )
+from vllm_ascend.distributed.parallel_state import get_kv_head_replica_group
 import vllm_ascend.ops.minimax_m3_sparse  # noqa: F401
 from vllm_ascend.ops.linear import AscendColumnParallelLinear
 from vllm_ascend.ops.linear_op import get_parallel_op
@@ -72,6 +74,7 @@ _SPARSE_ATTN_NEW_OP_PP_SIZE = 8
 
 _SPARSE_ATTN_LOGGED = False
 FP8_E4M3_MAX = 448.0
+_INDEX_LOCAL_CP_QUERY_TILE_SIZE = 128
 
 
 
@@ -189,6 +192,59 @@ def _active_prefill_num_reqs(
     return min(1, num_prefills)
 
 
+def _build_local_cp_query_tile_layout(
+    query_lens_cpu: torch.Tensor,
+    local_cp_size: int,
+    local_cp_rank: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    """Pack round-robin query tiles as independent local pseudo requests.
+
+    Returns query indices into the original flattened prefill tensor, original
+    request indices and offsets for every pseudo request, its cu-seqlens, and
+    the maximum local pseudo-request length.
+    """
+    query_index_parts: list[torch.Tensor] = []
+    request_indices: list[int] = []
+    request_offsets: list[int] = []
+    local_cu_seqlens = [0]
+    max_local_query_len = 0
+    query_base = 0
+
+    for request_index, query_len in enumerate(query_lens_cpu.tolist()):
+        num_tiles = (query_len + _INDEX_LOCAL_CP_QUERY_TILE_SIZE - 1) // _INDEX_LOCAL_CP_QUERY_TILE_SIZE
+        for tile_index in range(local_cp_rank, num_tiles, local_cp_size):
+            request_offset = tile_index * _INDEX_LOCAL_CP_QUERY_TILE_SIZE
+            tile_len = min(
+                _INDEX_LOCAL_CP_QUERY_TILE_SIZE,
+                query_len - request_offset,
+            )
+            query_index_parts.append(
+                torch.arange(
+                    query_base + request_offset,
+                    query_base + request_offset + tile_len,
+                    dtype=torch.int64,
+                )
+            )
+            request_indices.append(request_index)
+            request_offsets.append(request_offset)
+            local_cu_seqlens.append(local_cu_seqlens[-1] + tile_len)
+            max_local_query_len = max(max_local_query_len, tile_len)
+        query_base += query_len
+
+    query_indices = (
+        torch.cat(query_index_parts)
+        if query_index_parts
+        else torch.empty(0, dtype=torch.int64)
+    )
+    return (
+        query_indices,
+        torch.tensor(request_indices, dtype=torch.int64),
+        torch.tensor(request_offsets, dtype=torch.int32),
+        torch.tensor(local_cu_seqlens, dtype=torch.int32),
+        max_local_query_len,
+    )
+
+
 class AscendMiniMaxM3IndexerBackend(AttentionBackend):
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.bfloat16, torch.float16]
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
@@ -287,6 +343,16 @@ class AscendMiniMaxM3IndexerCache(nn.Module, AttentionLayerBase):
 
 
 @dataclass
+class AscendMiniMaxM3IndexerLocalCPMetadata:
+    query_indices: torch.Tensor
+    cu_seqlens_q: torch.Tensor
+    seq_lens: torch.Tensor
+    context_lens: torch.Tensor
+    block_table: torch.Tensor
+    max_query_len: int
+
+
+@dataclass
 class AscendMiniMaxM3IndexerPrefillMetadata:
     cu_seqlens_q: torch.Tensor
     seq_lens: torch.Tensor
@@ -294,6 +360,7 @@ class AscendMiniMaxM3IndexerPrefillMetadata:
     block_table: torch.Tensor
     max_query_len: int
     max_seq_len: int
+    local_cp: AscendMiniMaxM3IndexerLocalCPMetadata | None = None
 
 
 @dataclass
@@ -333,6 +400,7 @@ class AscendMiniMaxM3IndexerMetadataBuilder(
         device: torch.device,
     ) -> None:
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+        self.device = device
         self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
         self.max_decode_query_len = self.reorder_batch_threshold
         self.context_len_buffer = torch.empty(
@@ -340,6 +408,24 @@ class AscendMiniMaxM3IndexerMetadataBuilder(
             dtype=torch.int32,
             device=device,
         )
+        total_num_kv_heads = vllm_config.model_config.get_total_num_kv_heads()
+        tensor_parallel_size = vllm_config.parallel_config.tensor_parallel_size
+        self.local_cp_size = 1
+        self.local_cp_rank = 0
+        if (
+            isinstance(total_num_kv_heads, int)
+            and total_num_kv_heads > 0
+            and tensor_parallel_size > total_num_kv_heads
+            and tensor_parallel_size % total_num_kv_heads == 0
+        ):
+            self.local_cp_size = tensor_parallel_size // total_num_kv_heads
+            local_cp_group = get_kv_head_replica_group()
+            if local_cp_group.world_size != self.local_cp_size:
+                raise RuntimeError(
+                    "M3 indexer metadata head-replica group size mismatch: "
+                    f"expected {self.local_cp_size}, got {local_cp_group.world_size}"
+                )
+            self.local_cp_rank = local_cp_group.rank_in_group
 
     def build(
         self,
@@ -372,12 +458,18 @@ class AscendMiniMaxM3IndexerMetadataBuilder(
                 qsl_cpu[num_decodes + 1 : prefill_end + 1]
                 - qsl_cpu[num_decodes:prefill_end]
             )
+            prefill_seq_lens_cpu = (
+                seq_lens[num_decodes:prefill_end]
+                .detach()
+                .cpu()
+                .to(torch.int32)
+            )
+            prefill_context_lens_cpu = (
+                prefill_seq_lens_cpu - prefill_query_lens_cpu
+            )
             prefill_context_lens = self.context_len_buffer[num_decodes:prefill_end]
             prefill_context_lens.copy_(
-                (
-                    seq_lens[num_decodes:prefill_end].detach().cpu()
-                    - prefill_query_lens_cpu
-                ).to(
+                prefill_context_lens_cpu.to(
                     device=self.context_len_buffer.device,
                     dtype=torch.int32,
                     non_blocking=True,
@@ -387,6 +479,71 @@ class AscendMiniMaxM3IndexerMetadataBuilder(
             cu_seqlens_q = (
                 query_start_loc[num_decodes : prefill_end + 1] - num_decode_tokens
             ).to(torch.int32)
+            local_cp_metadata: AscendMiniMaxM3IndexerLocalCPMetadata | None = None
+            if self.local_cp_size > 1:
+                (
+                    local_query_indices_cpu,
+                    local_request_indices_cpu,
+                    local_request_offsets_cpu,
+                    local_cu_seqlens_cpu,
+                    local_max_query_len,
+                ) = _build_local_cp_query_tile_layout(
+                    prefill_query_lens_cpu,
+                    self.local_cp_size,
+                    self.local_cp_rank,
+                )
+                local_query_indices = local_query_indices_cpu.to(
+                    device=self.device,
+                    non_blocking=True,
+                )
+                local_request_indices = local_request_indices_cpu.to(
+                    device=self.device,
+                    non_blocking=True,
+                )
+                local_request_offsets = local_request_offsets_cpu.to(
+                    device=self.device,
+                    non_blocking=True,
+                )
+                local_cu_seqlens = local_cu_seqlens_cpu.to(
+                    device=self.device,
+                    non_blocking=True,
+                )
+                prefill_seq_lens = seq_lens[num_decodes:prefill_end]
+                prefill_block_table = block_table[num_decodes:prefill_end]
+                num_local_tiles = local_request_indices.shape[0]
+                # seq_lens is addressed as a flat pointer by the Triton kernel,
+                # so it must be materialized rather than stride-0 expanded.
+                local_seq_lens = torch.index_select(
+                    prefill_seq_lens,
+                    0,
+                    local_request_indices,
+                )
+                if active_prefills == 1:
+                    # block_table supplies its row stride to the kernel, so a
+                    # stride-0 view safely avoids duplicating a 1M-context table.
+                    local_block_table = prefill_block_table.expand(
+                        num_local_tiles,
+                        -1,
+                    )
+                else:
+                    local_block_table = torch.index_select(
+                        prefill_block_table,
+                        0,
+                        local_request_indices,
+                    )
+                local_context_lens = torch.index_select(
+                    prefill_context_lens,
+                    0,
+                    local_request_indices,
+                ) + local_request_offsets
+                local_cp_metadata = AscendMiniMaxM3IndexerLocalCPMetadata(
+                    query_indices=local_query_indices,
+                    cu_seqlens_q=local_cu_seqlens,
+                    seq_lens=local_seq_lens,
+                    context_lens=local_context_lens,
+                    block_table=local_block_table,
+                    max_query_len=local_max_query_len,
+                )
             prefill_metadata = AscendMiniMaxM3IndexerPrefillMetadata(
                 cu_seqlens_q=cu_seqlens_q,
                 seq_lens=seq_lens[num_decodes:prefill_end],
@@ -394,6 +551,7 @@ class AscendMiniMaxM3IndexerMetadataBuilder(
                 block_table=block_table[num_decodes:prefill_end],
                 max_query_len=common_attn_metadata.max_query_len,
                 max_seq_len=common_attn_metadata.max_seq_len,
+                local_cp=local_cp_metadata,
             )
 
         decode_metadata: AscendMiniMaxM3IndexerDecodeMetadata | None = None
@@ -441,6 +599,7 @@ class AscendMiniMaxM3IndexerImpl(nn.Module):
         local_blocks: int = 0,
         cache_config: CacheConfig | None = None,
         indexer_kv_dtype: str = "bf16",
+        head_replica_size: int = 1,
     ) -> None:
         super().__init__()
         self.num_kv_heads = num_kv_heads
@@ -451,6 +610,17 @@ class AscendMiniMaxM3IndexerImpl(nn.Module):
         self.local_blocks = local_blocks
         self.num_index_heads = num_index_heads
         self.index_head_dim = index_head_dim
+        self.local_cp_size = head_replica_size
+        self.local_cp_rank = 0
+        self.local_cp_group = None
+        if self.local_cp_size > 1:
+            self.local_cp_group = get_kv_head_replica_group()
+            if self.local_cp_group.world_size != self.local_cp_size:
+                raise RuntimeError(
+                    "M3 indexer head-replica group size mismatch: "
+                    f"expected {self.local_cp_size}, got {self.local_cp_group.world_size}"
+                )
+            self.local_cp_rank = self.local_cp_group.rank_in_group
         self.index_cache = AscendMiniMaxM3IndexerCache(
             head_dim=index_head_dim,
             prefix=f"{prefix}.index_cache",
@@ -496,26 +666,90 @@ class AscendMiniMaxM3IndexerImpl(nn.Module):
         if index_md.num_prefills > 0:
             p = index_md.prefill
             assert p is not None
-            score = minimax_m3_index_score(
-                iq[nd:],
-                kv,
-                p.block_table,
-                p.cu_seqlens_q,
-                p.seq_lens,
-                p.context_lens,
-                p.max_query_len,
-                p.max_seq_len,
-                self.num_kv_heads,
-            )
-            prefill_topk = minimax_m3_index_topk(
-                score,
-                p.cu_seqlens_q,
-                p.context_lens,
-                p.max_query_len,
-                self.topk_blocks,
-                self.init_blocks,
-                self.local_blocks,
-            )
+            local_cp = p.local_cp
+            if local_cp is None:
+                score = minimax_m3_index_score(
+                    iq[nd:],
+                    kv,
+                    p.block_table,
+                    p.cu_seqlens_q,
+                    p.seq_lens,
+                    p.context_lens,
+                    p.max_query_len,
+                    p.max_seq_len,
+                    self.num_kv_heads,
+                )
+                prefill_topk = minimax_m3_index_topk(
+                    score,
+                    p.cu_seqlens_q,
+                    p.context_lens,
+                    p.max_query_len,
+                    self.topk_blocks,
+                    self.init_blocks,
+                    self.local_blocks,
+                )
+            else:
+                num_prefill_tokens = iq.shape[0] - nd
+                prefill_topk = torch.full(
+                    (
+                        self.num_index_heads,
+                        num_prefill_tokens,
+                        self.topk_blocks,
+                    ),
+                    -1,
+                    dtype=torch.int32,
+                    device=iq.device,
+                )
+                if local_cp.query_indices.numel() > 0:
+                    prefill_iq = iq[nd:]
+                    if prefill_iq.dtype == torch.float8_e4m3fn:
+                        # aclnnIndexSelect does not support FP8 E4M3. Both
+                        # dtypes are one byte, so select the unchanged payload
+                        # as uint8 and reinterpret it as FP8 afterwards.
+                        local_iq = torch.index_select(
+                            prefill_iq.view(torch.uint8),
+                            0,
+                            local_cp.query_indices,
+                        ).view(torch.float8_e4m3fn)
+                    else:
+                        local_iq = torch.index_select(
+                            prefill_iq,
+                            0,
+                            local_cp.query_indices,
+                        )
+                    local_score = minimax_m3_index_score(
+                        local_iq,
+                        kv,
+                        local_cp.block_table,
+                        local_cp.cu_seqlens_q,
+                        local_cp.seq_lens,
+                        local_cp.context_lens,
+                        local_cp.max_query_len,
+                        p.max_seq_len,
+                        self.num_kv_heads,
+                    )
+                    local_topk = minimax_m3_index_topk(
+                        local_score,
+                        local_cp.cu_seqlens_q,
+                        local_cp.context_lens,
+                        local_cp.max_query_len,
+                        self.topk_blocks,
+                        self.init_blocks,
+                        self.local_blocks,
+                    )
+                    prefill_topk.index_copy_(
+                        1,
+                        local_cp.query_indices,
+                        local_topk,
+                    )
+                assert self.local_cp_group is not None
+                # Every pseudo request is owned by one local-CP rank. The
+                # remaining rows stay -1, so MAX restores the full top-k tensor.
+                dist.all_reduce(
+                    prefill_topk,
+                    op=dist.ReduceOp.MAX,
+                    group=self.local_cp_group.device_group,
+                )
         return decode_topk, prefill_topk
 
 
@@ -534,6 +768,7 @@ class AscendMiniMaxM3Indexer(nn.Module):
         local_blocks: int = 0,
         cache_config: CacheConfig | None = None,
         indexer_kv_dtype: str = "bf16",
+        head_replica_size: int = 1,
     ) -> None:
         super().__init__()
         self.impl = AscendMiniMaxM3IndexerImpl(
@@ -548,6 +783,7 @@ class AscendMiniMaxM3Indexer(nn.Module):
             local_blocks=local_blocks,
             cache_config=cache_config,
             indexer_kv_dtype=indexer_kv_dtype,
+            head_replica_size=head_replica_size,
         )
 
     @property
@@ -1227,6 +1463,7 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             local_blocks=sparse_cfg.get("sparse_local_block", 0),
             cache_config=cache_config,
             indexer_kv_dtype=self.indexer_kv_dtype,
+            head_replica_size=self.qkv_proj.num_kv_head_replicas,
         )
 
         compilation_config = vllm_config.compilation_config
@@ -1239,9 +1476,10 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         if not _SPARSE_ATTN_LOGGED:
             logger.warning(
                 "MiniMax M3 sparse attention enabled "
-                "(topk_blocks=%d, block_size=%d)",
+                "(topk_blocks=%d, block_size=%d, local_index_cp=%d)",
                 sparse_cfg["sparse_topk_blocks"],
                 sparse_cfg["sparse_block_size"],
+                self.qkv_proj.num_kv_head_replicas,
             )
             _SPARSE_ATTN_LOGGED = True
 

@@ -631,10 +631,14 @@ class AscendMiniMaxM3IndexerImpl(nn.Module):
     def forward(
         self,
         index_query: torch.Tensor,
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    ) -> tuple[
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+    ]:
         attn_metadata = get_forward_context().attn_metadata
         if not isinstance(attn_metadata, dict):
-            return None, None
+            return None, None, None
         index_md = attn_metadata[self.index_cache.prefix]
         assert isinstance(index_md, AscendMiniMaxM3IndexerMetadata)
         num_tokens = index_md.num_actual_tokens
@@ -646,10 +650,11 @@ class AscendMiniMaxM3IndexerImpl(nn.Module):
 
         decode_topk: torch.Tensor | None = None
         prefill_topk: torch.Tensor | None = None
+        decode_select_num_idx: torch.Tensor | None = None
         if index_md.num_decodes > 0:
             d = index_md.decode
             assert d is not None
-            decode_topk = minimax_m3_index_decode(
+            decode_topk, decode_select_num_idx = minimax_m3_index_decode(
                 iq[:nd],
                 kv,
                 d.block_table,
@@ -750,7 +755,7 @@ class AscendMiniMaxM3IndexerImpl(nn.Module):
                     op=dist.ReduceOp.MAX,
                     group=self.local_cp_group.device_group,
                 )
-        return decode_topk, prefill_topk
+        return decode_topk, prefill_topk, decode_select_num_idx
 
 
 class AscendMiniMaxM3Indexer(nn.Module):
@@ -793,7 +798,11 @@ class AscendMiniMaxM3Indexer(nn.Module):
     def forward(
         self,
         index_query: torch.Tensor,
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    ) -> tuple[
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+    ]:
         return self.impl(index_query)
 
 
@@ -989,7 +998,7 @@ class AscendMiniMaxM3SparseMetadataBuilder(
             decode_actual_seq_lengths = torch.full(
                 (active_decodes,),
                 decode_query_len,
-                dtype=torch.int64,
+                dtype=torch.int32,
                 device=seq_lens.device,
             )
             decode_actual_seq_lengths_kv = decode_seq_lens.to(
@@ -1048,13 +1057,18 @@ class AscendMiniMaxM3SparseImpl(AttentionImplBase[AscendMiniMaxM3SparseMetadata]
             if pp_size == _SPARSE_ATTN_NEW_OP_PP_SIZE
             else minimax_m3_sparse_attn_ascendc_legacy
         )
+        self._dequant_scale_buf: torch.Tensor | None = None
 
     def forward(
         self,
         layer: AttentionLayer,
         query: torch.Tensor,
         kv_cache: torch.Tensor,
-        topk_idx: tuple[torch.Tensor | None, torch.Tensor | None],
+        topk_idx: tuple[
+            torch.Tensor | None,
+            torch.Tensor | None,
+            torch.Tensor | None,
+        ],
         output: torch.Tensor,
     ) -> torch.Tensor:
         attn_metadata = get_forward_context().attn_metadata
@@ -1062,7 +1076,7 @@ class AscendMiniMaxM3SparseImpl(AttentionImplBase[AscendMiniMaxM3SparseMetadata]
             return output
         main_md = attn_metadata[layer.layer_name]
         assert isinstance(main_md, AscendMiniMaxM3SparseMetadata)
-        decode_topk, prefill_topk = topk_idx
+        decode_topk, prefill_topk, decode_select_num_idx = topk_idx
 
         nd = main_md.num_decode_tokens
         num_tokens = main_md.num_actual_tokens
@@ -1149,16 +1163,24 @@ class AscendMiniMaxM3SparseImpl(AttentionImplBase[AscendMiniMaxM3SparseMetadata]
         if main_md.num_decodes > 0:
             d = main_md.decode
             assert d is not None and decode_topk is not None
+            assert decode_select_num_idx is not None
+            if self._dequant_scale_buf is None:
+                self._dequant_scale_buf = torch.ones(
+                    1, dtype=torch.float32, device=query.device
+                )
             minimax_m3_sparse_attn_decode_ascendc(
                 q[:nd],
                 kv_cache,
                 decode_topk,
+                decode_select_num_idx,
                 d.block_table,
+                d.actual_seq_lengths,
                 d.seq_lens,
                 self.num_kv_heads,
                 self.scale,
                 out[:nd],
                 d.decode_query_len,
+                self._dequant_scale_buf,
                 block_size=self.block_size,
             )
 

@@ -488,6 +488,7 @@ def _decode_index_score_pad_tail_kernel(
 @triton.jit(do_not_specialize=["decode_query_len"])
 def _topk_index_mask_invalid_kernel(
     ti_ptr,  # [num_idx_heads, total_q, topk] int32 in/out
+    sni_ptr,  # [num_idx_heads, total_q] int32 out (valid block count per head/q)
     seq_lens,  # [num_reqs]
     block_size: tl.constexpr,  # sparse block size (128)
     topk: tl.constexpr,
@@ -495,6 +496,8 @@ def _topk_index_mask_invalid_kernel(
     stride_ti_h,
     stride_ti_b,
     stride_ti_t,
+    stride_sni_h,
+    stride_sni_b,
     BLOCK_SIZE_T: tl.constexpr,
 ):
     pid_b = tl.program_id(0)  # flattened query-token id
@@ -519,6 +522,11 @@ def _topk_index_mask_invalid_kernel(
     valid_idx = (idx >= 0) & (idx < num_blocks)
     masked_idx = tl.where(valid_slot & valid_idx, idx, -1)
     tl.store(ti_ptrs, masked_idx.to(ti_ptr.dtype.element_ty), mask=store_mask)
+
+    # Count valid (non -1) entries per (head, query) -> select_num_idx, so the
+    # downstream SparseAttentionScore op avoids the GreaterEqual+ReduceSum pair.
+    valid_count = tl.sum((valid_slot & valid_idx).to(tl.int32))
+    tl.store(sni_ptr + pid_h * stride_sni_h + pid_b * stride_sni_b, valid_count)
 
 
 # ---------------------------------------------------------------------------
@@ -906,7 +914,9 @@ def minimax_m3_index_decode(
 ) -> torch.Tensor:
     """Decode index block-score + top-k (torch.topk + invalid-index mask).
 
-    Returns topk_idx [num_kv_heads, total_q, topk] (0-indexed block ids, -1 pad).
+    Returns (topk_idx, select_num_idx):
+      - topk_idx [num_kv_heads, total_q, topk] (0-indexed block ids, -1 pad).
+      - select_num_idx [num_kv_heads, total_q] int32 (valid block count).
     When ``out`` ([num_kv_heads, >=total_q, topk]) is given, writes into
     ``out[:, :total_q, :]`` (stable address for cudagraph) instead of allocating.
     """
@@ -1000,8 +1010,12 @@ def minimax_m3_index_decode(
             topk_idx[..., :max_block].copy_(topk_idx_raw.to(torch.int32))
         else:
             topk_idx = topk_idx_raw.to(torch.int32)
+    select_num_idx = torch.empty(
+        (num_idx_heads, total_q), dtype=torch.int32, device=idx_q.device
+    )
     _topk_index_mask_invalid_kernel[(batch, num_idx_heads)](
         topk_idx,
+        select_num_idx,
         seq_lens,
         SPARSE_BLOCK_SIZE,
         topk,
@@ -1009,8 +1023,10 @@ def minimax_m3_index_decode(
         topk_idx.stride(0),
         topk_idx.stride(1),
         topk_idx.stride(2),
+        select_num_idx.stride(0),
+        select_num_idx.stride(1),
     )
-    return topk_idx
+    return topk_idx, select_num_idx
 
 
 # ---------------------------------------------------------------------------

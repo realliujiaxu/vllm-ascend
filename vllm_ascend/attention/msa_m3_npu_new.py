@@ -33,10 +33,6 @@ def _split_main_kv_cache(
     return k_cache, v_cache
 
 
-def _select_num_idx_from_topk(topk_idx: torch.Tensor) -> torch.Tensor:
-    return (topk_idx >= 0).sum(dim=-1).to(dtype=torch.int32)
-
-
 def _build_cu_block_lens(
     seq_lens: torch.Tensor,
     block_size: int,
@@ -155,43 +151,38 @@ def minimax_m3_sparse_attn_decode(
     q: torch.Tensor,
     kv_cache: torch.Tensor | tuple[torch.Tensor, ...] | list[torch.Tensor],
     topk_idx: torch.Tensor,
+    select_num_idx: torch.Tensor,
     block_table: torch.Tensor,
+    q_lens: torch.Tensor,
     seq_lens: torch.Tensor,
     num_kv_heads: int,
     sm_scale: float,
     output: torch.Tensor,
     decode_query_len: int,
+    dequant_scale_buf: torch.Tensor,
     block_size: int = 128,
 ) -> None:
     num_reqs = seq_lens.shape[0]
     active_tokens = num_reqs * decode_query_len
     q_active = q[:active_tokens]
     topk_active = topk_idx[:, :active_tokens]
+    select_num_idx_active = select_num_idx[:, :active_tokens]
     key, value = _split_main_kv_cache(kv_cache)
-    q_lens_t = torch.full(
-        (num_reqs,),
-        decode_query_len,
-        device=q.device,
-        dtype=torch.int32,
-    )
     q_fp8 = _to_fp8(q_active)
     key_fp8 = key if key.dtype == torch.float8_e4m3fn else _to_fp8(key)
     value_fp8 = value if value.dtype == torch.float8_e4m3fn else _to_fp8(value)
-    q_scale = torch.ones(1, dtype=torch.float32, device=q_active.device)
-    k_scale = torch.ones(1, dtype=torch.float32, device=key.device)
-    v_scale = torch.ones(1, dtype=torch.float32, device=value.device)
     out = torch.ops._C_ascend.npu_sparse_attention_score(
         q_fp8,
         key_fp8,
         value_fp8,
         topk_active,
         block_table,
-        select_num_idx=_select_num_idx_from_topk(topk_active),
-        actual_seq_lengths=q_lens_t,
+        select_num_idx=select_num_idx_active,
+        actual_seq_lengths=q_lens,
         actual_seq_lengths_kv=seq_lens,
-        q_dequant_scale=q_scale,
-        k_dequant_scale=k_scale,
-        v_dequant_scale=v_scale,
+        q_dequant_scale=dequant_scale_buf,
+        k_dequant_scale=dequant_scale_buf,
+        v_dequant_scale=dequant_scale_buf,
         num_key_value_heads=num_kv_heads,
         scale_value=sm_scale,
         block_size=block_size,

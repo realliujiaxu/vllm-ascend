@@ -1702,7 +1702,7 @@ def test_native_draft_physical_pool_cannot_overwrite_target_or_state(dcp, layout
     assert _pool_bytes_per_block_from_builder(AscendKVCacheConfigBuilder(), config, groups) == bytes_per_block
     budget = 11 * bytes_per_block + bytes_per_block // 2
     planned = get_ascend_kv_cache_config_from_groups(config, groups, num_blocks=11)
-    expected_blocks = 11 if num_blocks_override is None else num_blocks_override
+    expected_blocks = 11
     assert planned.num_blocks == expected_blocks
     assert planned.kv_cache_groups is groups
     assert {tensor.size for tensor in planned.kv_cache_tensors} == {expected_blocks * bytes_per_block}
@@ -1719,4 +1719,5 @@ def test_native_draft_physical_pool_cannot_overwrite_target_or_state(dcp, layout
     assert backing[draft_start:draft_end].eq(91).all()
     # Rank re-planning must retain exactly the agreed block count.
     replanned = get_ascend_kv_cache_config_from_groups(config, groups, num_blocks=7)
-    assert replanned.num_blocks == (7 if num_blocks_override is None else num_blocks_override)
+    assert replanned.num_blocks == 7
+    assert config.cache_config.num_gpu_blocks_override is num_blocks_override

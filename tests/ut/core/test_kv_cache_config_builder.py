@@ -281,6 +281,15 @@ def test_core_applies_capacity_and_converges_worker_layouts(monkeypatch, overrid
     assert all(r.kv_cache_tensors == expected.kv_cache_tensors for r in results)
 
 
+def test_empty_materialization_keeps_null_block_and_transfer_metadata():
+    config = materialization_config()
+    config.kv_transfer_config = SimpleNamespace(is_kv_producer=True)
+    result = AscendKVCacheConfigBuilder().get_kv_cache_config_from_groups(config, [], 17)
+    assert result.num_blocks == 1
+    assert result.kv_cache_tensors == []
+    assert result.kv_transfer_config is config.kv_transfer_config
+
+
 def test_glm_materialization_preserves_core_count_and_both_backings():
     config = materialization_config(override=99)
     config.model_config = SimpleNamespace(max_model_len=2048, hf_config=SimpleNamespace(model_type="glm5_next"))

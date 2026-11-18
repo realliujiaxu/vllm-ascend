@@ -10,6 +10,7 @@ no longer needs a monkey patch for these decisions.
 """
 
 from collections import defaultdict
+from copy import copy
 from dataclasses import replace
 
 from vllm.config import VllmConfig
@@ -17,11 +18,9 @@ from vllm.utils.math_utils import cdiv, round_up
 from vllm.v1.core.kv_cache_planning import (
     DefaultKVCacheConfigBuilder,
     _approximate_gcd,
-    may_override_num_blocks,
     unify_hybrid_kv_cache_specs,
 )
 from vllm.v1.core.kv_cache_planning import _pool_bytes_per_block as _upstream_pool_bytes_per_block
-from vllm.v1.core.kv_cache_planning import get_kv_cache_config_from_groups as _upstream_get_kv_cache_config_from_groups
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
@@ -114,10 +113,6 @@ class AscendKVCacheConfigBuilder(DefaultKVCacheConfigBuilder):
         num_blocks: int,
     ) -> KVCacheConfig:
         """Materialize Core's block count; Qwen4 retains its budget planner."""
-        # Preserve the default fallback from #21345. Metadata propagation for
-        # ordinary/empty layouts is handled by a separate follow-up.
-        if self._get_pool_bytes_per_block(vllm_config, kv_cache_groups) is None:
-            return super().get_kv_cache_config_from_groups(vllm_config, kv_cache_groups, num_blocks)
         return get_ascend_kv_cache_config_from_groups(vllm_config, kv_cache_groups, num_blocks)
 
     def _get_pool_bytes_per_block(
@@ -452,8 +447,6 @@ def get_ascend_kv_cache_config_from_groups(
 
     Qwen4 keeps its existing budget-based planner until its kernel/storage
     layout can be revisited. Other model planners do not reselect capacity.
-    Independent generic draft pools retain their pre-existing override
-    behavior in this change.
     """
     pools = _get_replicated_draft_pools(kv_cache_groups)
     if not kv_cache_groups:
@@ -463,16 +456,22 @@ def get_ascend_kv_cache_config_from_groups(
     elif vllm_config.model_config.hf_config.model_type == "kimi_k31":
         kv_cache_config = paired_sfa_cache_config(vllm_config, kv_cache_groups, num_blocks)
     elif pools is not None:
-        # Preserve #21345's independent-pool override and placement behavior;
-        # this path is separate from the model-planner API migration.
+        # Pools own disjoint byte ranges but use Core's common block count.
         pool_bytes = [_upstream_pool_bytes_per_block(vllm_config, pool) for pool in pools]
-        num_blocks = may_override_num_blocks(vllm_config, num_blocks)
         total_size = num_blocks * sum(pool_bytes)
+        # The default builder still has a legacy budget adapter that applies
+        # override. Suppress it on an isolated config for per-pool placement;
+        # Core has already selected the count, including cross-worker shrink.
+        pool_vllm_config = copy(vllm_config)
+        pool_vllm_config.cache_config = copy(vllm_config.cache_config)
+        pool_vllm_config.cache_config.num_gpu_blocks_override = None
         kv_cache_tensors: list[KVCacheTensor] = []
         offset = 0
         for pool, pool_bytes_per_block in zip(pools, pool_bytes):
             pool_size = num_blocks * pool_bytes_per_block
-            pool_config = _upstream_get_kv_cache_config_from_groups(vllm_config, pool, pool_size)
+            pool_config = DefaultKVCacheConfigBuilder().get_kv_cache_config_from_groups(
+                pool_vllm_config, pool, num_blocks
+            )
             assert pool_config.num_blocks == num_blocks
             kv_cache_tensors.extend(
                 replace(tensor, size=total_size, offset=offset + tensor.offset)
